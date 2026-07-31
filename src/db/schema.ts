@@ -404,6 +404,15 @@ export const matchReviews = pgTable("match_reviews", {
   resolvedAt: text("resolved_at"),
 });
 
+/** What a client-migration import added to client records that already existed
+    (multi-program enrollment: the person is on file, the program is new to them).
+    Those rows carry no import_job_id — the client predates the import and must
+    survive an undo — so the additions are recorded here to stay reversible. */
+export interface ImportAdditions {
+  enrollments: Array<{ clientId: string; programId: string }>;
+  serviceLogIds: number[];
+}
+
 // Spreadsheet import history (Data & integrations → Import spreadsheet)
 export const importJobs = pgTable("import_jobs", {
   id: integer("id").primaryKey().generatedByDefaultAsIdentity(),
@@ -415,6 +424,8 @@ export const importJobs = pgTable("import_jobs", {
   skipped: integer("skipped").notNull().default(0),
   staffId: text("staff_id").notNull(),
   detail: text("detail").notNull().default(""),
+  // enrollments/services this import added to pre-existing clients (undo needs them)
+  additions: jsonb("additions").$type<ImportAdditions>(),
 });
 
 // ---------- Audit log ----------

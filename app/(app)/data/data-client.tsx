@@ -538,6 +538,17 @@ function ImportWizard({ onClose, toast, programs, fplYears, services }: {
           <Notice tone={result.imported + result.updated > 0 ? "good" : "warn"} icon={result.imported + result.updated > 0 ? "check" : "alert"}>
             {result.message}
           </Notice>
+          {result.notes.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontFamily: "var(--font-sub)", fontSize: 10, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: "var(--calv-slate-65)", marginBottom: 6 }}>
+                Added to existing records
+              </div>
+              <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, color: "var(--calv-slate-65)", lineHeight: 1.7 }}>
+                {result.notes.slice(0, 8).map((n, i) => <li key={i}>{n}</li>)}
+              </ul>
+              {result.notes.length > 8 ? <p style={{ fontSize: 11.5, color: "var(--calv-slate-65)", margin: "6px 0 0" }}>…and {result.notes.length - 8} more.</p> : null}
+            </div>
+          ) : null}
           {result.errors.length > 0 ? (
             <div style={{ marginTop: 12 }}>
               <div style={{ fontFamily: "var(--font-sub)", fontSize: 10, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: "var(--calv-slate-65)", marginBottom: 6 }}>

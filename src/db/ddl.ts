@@ -247,6 +247,9 @@ ALTER TABLE clients ADD COLUMN IF NOT EXISTS import_job_id INTEGER;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_scale INTEGER NOT NULL DEFAULT 100;
 ALTER TABLE applications ADD COLUMN IF NOT EXISTS income_worksheet JSONB;
 ALTER TABLE applications ADD COLUMN IF NOT EXISTS determination JSONB;
+-- Multi-program imports: enrollments/services added to already-existing clients,
+-- kept so undo can reverse them (those clients carry no import_job_id).
+ALTER TABLE import_jobs ADD COLUMN IF NOT EXISTS additions JSONB;
 ALTER TABLE organization ADD COLUMN IF NOT EXISTS contact_line TEXT NOT NULL DEFAULT '';
 -- TOTP MFA + session metadata
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT;
