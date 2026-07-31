@@ -1,7 +1,6 @@
 import "server-only";
 import { db, t } from "@/db";
 import { getOrg, getEnabledIntakeFields, kvGet } from "@/lib/data/core";
-import { orgFY } from "@/lib/access";
 import { fplStatusFor } from "@/lib/fpl";
 import { completenessPct } from "@/lib/completeness";
 import { ageFromDob, todayIso } from "@/lib/format";
@@ -10,12 +9,22 @@ import {
 } from "@/lib/csbg-catalog";
 import type { Client } from "@/db/schema";
 import type { MiniRow, MiniTableData, DriftEntry, ReportRollup } from "./types";
+import { resolveFilters, type ReportFilters } from "./filters";
 
 /* ============================================================
    Live CSBG Annual Report 3.0 rollup (Module 3 Sections A/B/C).
-   Agency-wide by design — reports cover ALL enrolled clients,
-   not the caller's program scope. Used by the Reports page and
-   the /reports/export download route.
+   Used by the Reports page and the /reports/export download route.
+
+   DEFAULT (no filters) is the authoritative submission view: the
+   current fiscal year, every program, ALL enrolled clients, with
+   the imported pre-system (CAP60/legacy) baselines layered in.
+
+   When a filter is applied (`filters.live`), the rollup narrows to
+   the chosen period / programs / service domains and counts PURELY
+   from in-system records — the pre-system baselines are dropped and
+   the top-line KPIs are recomputed live, because those imports carry
+   no date/program/service dimension to slice on. Two different
+   questions, kept honestly separate.
 
    Section C tallies use the INSTRUMENT'S canonical answer
    strings (canonicalCharacteristic) — display-list edits can't
@@ -81,16 +90,28 @@ function shortServiceLabel(label: string): string {
   return base.charAt(0).toLowerCase() + base.slice(1);
 }
 
-export async function buildRollup(): Promise<ReportRollup> {
-  const fy = await orgFY();
+export async function buildRollup(filters?: ReportFilters): Promise<ReportRollup> {
   const org = await getOrg();
+  const f = filters ?? resolveFilters({}, org.fyStart);
+  const fy = f.period;
+  const live = f.live;
+  // Section C tallies over ALL active clients for the federal view; a chosen
+  // period (not "current") additionally narrows to clients enrolled within it.
+  const periodScoped = f.preset !== "current";
   const fields = await getEnabledIntakeFields();
-  const clients = (await db.select().from(t.clients)).filter((c) => c.status === "active");
-  const n = clients.length;
 
-  const agency = await kvGet<{ individualsServed: number; householdsServed: number; newThisFY: number }>(
-    "agency", { individualsServed: 0, householdsServed: 0, newThisFY: 0 },
-  );
+  let clients = (await db.select().from(t.clients)).filter((c) => c.status === "active");
+  if (f.programIds.length) {
+    const scope = new Set(f.programIds);
+    const inScope = new Set(
+      (await db.select().from(t.clientPrograms)).filter((m) => scope.has(m.programId)).map((m) => m.clientId),
+    );
+    clients = clients.filter((c) => inScope.has(c.id));
+  }
+  if (periodScoped) clients = clients.filter((c) => c.enrolled >= fy.start && c.enrolled <= fy.end);
+  const n = clients.length;
+  // New enrollments within the reporting window (live-computable either way).
+  const newInPeriod = clients.filter((c) => c.enrolled >= fy.start && c.enrolled <= fy.end).length;
 
   // Records report-ready — % of enrolled records with every report field captured (computed live).
   const readyPct = n === 0 ? 100
@@ -183,21 +204,30 @@ export async function buildRollup(): Promise<ReportRollup> {
   // ---------- Section A — services by domain ----------
   // The kv aggregates are the imported pre-system baseline (CAP60/legacy history);
   // everything recorded in THIS system's service log is layered on top live, so
-  // "Service logged — mapped to <code> for the rollup" is actually true.
+  // "Service logged — mapped to <code> for the rollup" is actually true. Under a
+  // filter the baseline is dropped (it carries no date/program/service dimension).
   const allServices = await db.select().from(t.services);
   const domainOf = new Map(allServices.map((s) => [s.code, s.domain]));
-  const fyLog = (await db.select().from(t.serviceLog))
-    .filter((s) => s.date >= fy.start && s.date <= fy.end);
+  const progScope = new Set(f.programIds);
+  const domainScope = new Set(f.domains);
+  const codeScope = new Set(f.serviceCodes);
+  const fyLog = (await db.select().from(t.serviceLog)).filter((s) =>
+    s.date >= fy.start && s.date <= fy.end &&
+    (progScope.size === 0 || progScope.has(s.programId)) &&
+    (codeScope.size === 0 || codeScope.has(s.code)) &&
+    (domainScope.size === 0 || domainScope.has(domainOf.get(s.code) ?? "")));
   const liveByDomain = new Map<string, number>();
   const liveByCode = new Map<string, number>();
+  const servedIds = new Set<string>();
   for (const s of fyLog) {
     const dom = domainOf.get(s.code);
     if (dom) liveByDomain.set(dom, (liveByDomain.get(dom) ?? 0) + 1);
     liveByCode.set(s.code, (liveByCode.get(s.code) ?? 0) + 1);
+    servedIds.add(s.clientId);
   }
 
-  const baseline = new Map((await kvGet<Array<{ domain: string; count: number }>>("srvByDomain", []))
-    .map((d) => [d.domain, d.count]));
+  const baseline = new Map(live ? [] : (await kvGet<Array<{ domain: string; count: number }>>("srvByDomain", []))
+    .map((d) => [d.domain, d.count] as const));
   const srvByDomain = [...new Set([...baseline.keys(), ...liveByDomain.keys()])]
     .flatMap((id) => {
       const dom = domainById(id);
@@ -207,8 +237,8 @@ export async function buildRollup(): Promise<ReportRollup> {
     .sort((a, b) => b.count - a.count);
 
   const serviceLabels = new Map(allServices.map((s) => [s.code, s.label]));
-  const topBaseline = new Map((await kvGet<Array<{ code: string; count: number }>>("topServices", []))
-    .map((s) => [s.code, s.count]));
+  const topBaseline = new Map(live ? [] : (await kvGet<Array<{ code: string; count: number }>>("topServices", []))
+    .map((s) => [s.code, s.count] as const));
   const topServices = [...new Set([...topBaseline.keys(), ...liveByCode.keys()])]
     .map((code) => ({
       code,
@@ -218,12 +248,20 @@ export async function buildRollup(): Promise<ReportRollup> {
     .sort((a, b) => b.count - a.count)
     .slice(0, 3);
 
+  // Top-line KPIs: the pre-system baseline for the federal view; recomputed
+  // live from the filtered service log when scoped (1 client record = 1 individual
+  // = 1 household in this model, so served individuals and households coincide).
+  const agency = live
+    ? { individualsServed: servedIds.size, householdsServed: servedIds.size, newThisFY: newInPeriod }
+    : await kvGet<{ individualsServed: number; householdsServed: number; newThisFY: number }>(
+        "agency", { individualsServed: 0, householdsServed: 0, newThisFY: 0 });
+
   // ---------- Section B — Individual & Family NPIs ----------
   // Counts come live from the client-level outcome log (unduplicated individuals
   // per indicator this FY); fnpi_progress contributes only the FY targets.
   // served = clients with any recorded outcome; actual = clients who achieved it.
-  const fyOutcomes = (await db.select().from(t.outcomeLog))
-    .filter((o) => o.date >= fy.start && o.date <= fy.end);
+  const fyOutcomes = (await db.select().from(t.outcomeLog)).filter((o) =>
+    o.date >= fy.start && o.date <= fy.end && (progScope.size === 0 || progScope.has(o.programId)));
   const servedBy = new Map<string, Set<string>>();
   const achievedBy = new Map<string, Set<string>>();
   for (const o of fyOutcomes) {
@@ -238,16 +276,16 @@ export async function buildRollup(): Promise<ReportRollup> {
   // recorded as aggregates (the seed sets these to 0, so a fresh install is purely live).
   // Layer live outcome-log counts on top of that baseline — the same pre-system-baseline
   // pattern Section A uses for srvByDomain/topServices.
-  const targets = new Map((await db.select().from(t.fnpiProgress)).map((f) => [f.code, f]));
+  const targets = new Map((await db.select().from(t.fnpiProgress)).map((p) => [p.code, p]));
   const fnpi = [...new Set([...targets.keys(), ...servedBy.keys()])]
     .map((code) => {
       const base = targets.get(code);
       return {
         code,
         label: fnpiByCode(code)?.label ?? base?.label ?? code,
-        served: (base?.served ?? 0) + (servedBy.get(code)?.size ?? 0),
+        served: (live ? 0 : base?.served ?? 0) + (servedBy.get(code)?.size ?? 0),
         target: base?.target ?? 0,
-        actual: (base?.actual ?? 0) + (achievedBy.get(code)?.size ?? 0),
+        actual: (live ? 0 : base?.actual ?? 0) + (achievedBy.get(code)?.size ?? 0),
       };
     })
     .filter((f) => f.served > 0 || f.target > 0)
@@ -272,9 +310,23 @@ export async function buildRollup(): Promise<ReportRollup> {
       };
     });
 
+  // Scope summary for the live-mode caveat shown on the page, exports, and PDF.
+  const programNames = f.programIds.length
+    ? (await db.select().from(t.programs))
+        .filter((p) => f.programIds.includes(p.id))
+        .map((p) => p.short || p.name)
+    : [];
+  const domainNames = f.domains.map((id) => domainById(id)?.name).filter((x): x is string => !!x);
+  const scopeNote = [
+    programNames.length ? `Programs: ${programNames.join(", ")}` : "",
+    domainNames.length ? `Services: ${domainNames.join(", ")}` : "",
+  ].filter(Boolean).join(" · ");
+
   return {
     fy: { label: fy.label, short: fy.short, range: fy.range, pctElapsed: fy.pctElapsed },
     orgName: org.name,
+    live,
+    scopeNote,
     generated: todayIso(),
     agency,
     clientCount: n,

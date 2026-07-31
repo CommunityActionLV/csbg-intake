@@ -58,6 +58,12 @@ export interface RomaGoalRow {
 export interface ReportRollup {
   fy: { label: string; short: string; range: string; pctElapsed: number };
   orgName: string;
+  /** True when a filter is active → figures are counted live from in-system
+      records only, EXCLUDING the imported pre-system (CAP60/legacy) baselines.
+      False = the authoritative CSBG submission view. */
+  live: boolean;
+  /** Human-readable scope applied (e.g. "Programs: Weatherization · Services: Housing"); "" when unfiltered. */
+  scopeNote: string;
   generated: string; // ISO date
   agency: { individualsServed: number; householdsServed: number; newThisFY: number };
   clientCount: number;
