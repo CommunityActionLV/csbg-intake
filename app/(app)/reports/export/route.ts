@@ -1,18 +1,21 @@
 import ExcelJS from "exceljs";
 import { requireUser } from "@/lib/auth";
 import { audit } from "@/lib/access";
-import { fmt } from "@/lib/format";
+import { getOrg } from "@/lib/data/core";
 import { CATALOG_VERSION } from "@/lib/csbg-catalog";
 import { buildRollup } from "../rollup";
+import { resolveFilters } from "../filters";
+import { renderReportPdf } from "./report-pdf";
 import { fnpiStats, type ReportRollup } from "../types";
 
 /* ============================================================
    GET /reports/export          → CSV rollup (Module 3 A/B/C)
-   GET /reports/export?packet=1 → Draft Annual Report packet (Markdown)
+   GET /reports/export?packet=1 → Draft Annual Report packet (branded PDF)
    GET /reports/export?xlsx=1   → Module 3 workbook (Excel), shaped like the
                                   OCS SmartForm sections for transcription
                                   into the state submission
-   All stream real files generated from live data.
+   All three honor the same ?period/programs/domains filter params as the
+   Reports page, and stream real files generated from live data.
    ============================================================ */
 
 export const dynamic = "force-dynamic";
@@ -81,82 +84,6 @@ function buildCsv(d: ReportRollup): string {
   L.push(row(`${d.fy.pctElapsed}% of the FY has elapsed — indicators under ${d.fy.pctElapsed - 5}% of target are flagged.`));
   // UTF-8 BOM so Excel renders em dashes / accents correctly
   return "\uFEFF" + L.join("\r\n") + "\r\n";
-}
-
-// ---------- Draft Annual Report packet (Markdown) ----------
-function buildPacket(d: ReportRollup): string {
-  const md = (s: string | number): string => String(s).replace(/\|/g, "\\|");
-  const out: string[] = [];
-  out.push(`# CSBG Annual Report 3.0 — ${d.fy.short} Draft`);
-  out.push("");
-  out.push(`**OMB 0970-0492 · Module 3 Sections A, B & C** — drafted ${d.generated} from live records.`);
-  out.push("");
-  out.push(`- Agency: ${d.orgName}`);
-  out.push(`- Fiscal year: ${d.fy.label} (${d.fy.range}) — ${d.fy.pctElapsed}% elapsed`);
-  out.push(`- Records report-ready: ${d.readyPct}% (${100 - d.readyPct}% have Unknown / Not Reported fields)`);
-  out.push("");
-
-  out.push("## Module 3, Section C — Summary");
-  out.push("");
-  out.push("| Line | Measure | Value |");
-  out.push("| --- | --- | ---: |");
-  out.push(`| A | Individuals served (unduplicated) | ${fmt(d.agency.individualsServed)} |`);
-  out.push(`| B | Households served (unduplicated) | ${fmt(d.agency.householdsServed)} |`);
-  out.push(`|   | New enrollments this FY | ${fmt(d.agency.newThisFY)} |`);
-  out.push(`|   | Individuals with 1+ characteristics obtained (live records) | ${fmt(d.sectionCTotals.individuals)} |`);
-  out.push(`|   | Households with 1+ characteristics obtained (live records) | ${fmt(d.sectionCTotals.households)} |`);
-  out.push("");
-  const dq = d.dataQuality.filter((q) => q.unknown > 0 || q.drift.length > 0);
-  if (dq.length > 0) {
-    out.push("### Section C validation — unknowns and answer-list drift");
-    out.push("");
-    out.push("| Characteristic | Unknown / Not Reported | Unmatched stored values |");
-    out.push("| --- | --- | --- |");
-    for (const q of dq) {
-      out.push(`| ${md(q.title)} | ${q.unknown > 0 ? `${q.unknown} of ${q.total}` : "—"} | ${md(q.drift.map((x) => `“${x.value}” ×${x.count}`).join(" · ")) || "—"} |`);
-    }
-    out.push("");
-  }
-
-  out.push("## Module 3, Section A — Services by domain");
-  out.push("");
-  out.push(`Unduplicated individuals served, ${d.fy.short} to date.`);
-  out.push("");
-  out.push("| Code | Domain | Individuals served |");
-  out.push("| --- | --- | ---: |");
-  for (const s of d.srvByDomain) out.push(`| ${md(s.code)} | ${md(s.name)} | ${fmt(s.count)} |`);
-  out.push("");
-  out.push(`Top single services: ${d.topServices.map((s) => `${s.code} ${s.label} (${fmt(s.count)})`).join(" · ")}.`);
-  out.push("");
-
-  out.push("## Module 3, Section B — Individual & Family NPIs");
-  out.push("");
-  out.push(`Actuals vs ${d.fy.short} targets. 'Achieving outcome' = actual ÷ number served; 'target accuracy' = actual ÷ target.`);
-  out.push("");
-  out.push("| Code | Indicator | Served | Target | Actual | % achieving | Target accuracy | Pace |");
-  out.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |");
-  for (const f of d.fnpi) {
-    const s = fnpiStats(f, d.fy.pctElapsed);
-    out.push(`| ${md(f.code)} | ${md(f.label)} | ${fmt(f.served)} | ${fmt(f.target)} | ${fmt(f.actual)} | ${s.achieving}% | ${s.accuracy}% | ${s.onPace ? "On pace" : "Behind"} |`);
-  }
-  out.push("");
-  out.push(`${d.fy.pctElapsed}% of the FY has elapsed — indicators under ${d.fy.pctElapsed - 5}% of target are flagged so program managers can act before September 30, not after.`);
-  out.push("");
-
-  out.push("## Module 3, Section C — All Characteristics Report");
-  out.push("");
-  out.push(`Tallied live from the ${d.clientCount} enrolled client records. Blank answers report as "Unknown / Not Reported."`);
-  for (const m of d.characteristics) {
-    out.push("");
-    out.push(`### ${m.title} (${m.code})`);
-    out.push("");
-    out.push("| Answer | Count |");
-    out.push("| --- | ---: |");
-    for (const r of m.rows) out.push(`| ${md(r.label)} | ${r.n} |`);
-    out.push(`| **TOTAL** | **${m.total}** |`);
-  }
-  out.push("");
-  return out.join("\n");
 }
 
 // ---------- Module 3 workbook (SmartForm-shaped Excel) ----------
@@ -232,41 +159,50 @@ async function buildXlsx(d: ReportRollup): Promise<Buffer> {
 
 export async function GET(req: Request): Promise<Response> {
   const user = await requireUser();
-  const params = new URL(req.url).searchParams;
+  const url = new URL(req.url);
+  const params = url.searchParams;
   const packet = params.get("packet") === "1";
   const xlsx = params.get("xlsx") === "1";
-  const d = await buildRollup();
 
-  if (xlsx) {
-    const body = await buildXlsx(d);
-    await audit(user.id, "report.xlsx", "report", d.fy.short,
-      "Module 3 workbook exported (SmartForm-shaped Excel, Sections A, B & C + validation)");
+  const org = await getOrg();
+  const filters = resolveFilters(Object.fromEntries(params), org.fyStart);
+  const d = await buildRollup(filters);
+  const slug = d.fy.short.toLowerCase().replace(/[^a-z0-9]+/g, "-") + (d.live ? "-filtered" : "");
+  const scope = d.live ? ` (filtered — live records only${d.scopeNote ? `; ${d.scopeNote}` : ""})` : "";
+
+  if (packet) {
+    const body = await renderReportPdf(d, { accent: org.accent, logoData: org.logoData, catalogVersion: CATALOG_VERSION });
+    await audit(user.id, "report.pdf", "report", d.fy.short,
+      `Annual Report PDF drafted — Module 3 Sections A, B & C${scope}`);
     return new Response(new Uint8Array(body), {
       headers: {
-        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "Content-Disposition": `attachment; filename="csbg-module4-${d.fy.short.toLowerCase()}.xlsx"`,
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `attachment; filename="csbg-annual-report-${slug}.pdf"`,
         "Cache-Control": "no-store",
       },
     });
   }
 
-  const body = packet ? buildPacket(d) : buildCsv(d);
-  const filename = `csbg-annual-report-${d.fy.short.toLowerCase()}-${packet ? "packet.md" : "rollup.csv"}`;
+  if (xlsx) {
+    const body = await buildXlsx(d);
+    await audit(user.id, "report.xlsx", "report", d.fy.short,
+      `Module 3 workbook exported (SmartForm-shaped Excel, Sections A, B & C + validation)${scope}`);
+    return new Response(new Uint8Array(body), {
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `attachment; filename="csbg-module4-${slug}.xlsx"`,
+        "Cache-Control": "no-store",
+      },
+    });
+  }
 
-  await audit(
-    user.id,
-    packet ? "report.packet" : "report.export",
-    "report",
-    d.fy.short,
-    packet
-      ? "Annual Report packet drafted — Module 3 Sections A, B & C"
-      : "CSV rollup exported (Module 3 Sections A, B & C)",
-  );
-
+  const body = buildCsv(d);
+  await audit(user.id, "report.export", "report", d.fy.short,
+    `CSV rollup exported (Module 3 Sections A, B & C)${scope}`);
   return new Response(body, {
     headers: {
-      "Content-Type": packet ? "text/markdown; charset=utf-8" : "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="csbg-annual-report-${slug}-rollup.csv"`,
       "Cache-Control": "no-store",
     },
   });

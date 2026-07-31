@@ -16,6 +16,26 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
   taxonomy (code — label), and the agency's **live** program, staff, and
   FPL-schedule lists at download time. Generated server-side (admin-only
   route), so ExcelJS stays out of the client bundle.
+### Reports: period/program/service filters + branded PDF
+- The Reports rollup can now be **filtered** by reporting period (current FY,
+  a prior FY, calendar year-to-date, or a custom date range), by **program**,
+  and by **service domain**. Filters live in the URL, so every export link
+  carries the same scope as the screen. The unfiltered default is unchanged and
+  remains the authoritative submission view (current FY, all programs, all
+  enrolled clients, pre-system baselines included).
+- **[compliance]** Applying any filter switches to a clearly labeled **"live
+  records only"** analysis: figures are counted purely from in-system records
+  and the imported pre-system (CAP60/legacy) baselines are **excluded**, because
+  those aggregates carry no date/program/service dimension to slice on. Top-line
+  KPIs are recomputed live under a filter. A banner on the page and a caveat on
+  the PDF spell this out so filtered numbers are never mistaken for the figures
+  you file.
+- The **Draft Annual Report** export now produces a professional, branded
+  **PDF** (agency accent color + logo) instead of a Markdown file — Module 3
+  Sections A, B & C with page numbering and a draft/confidentiality footer.
+  Rendered with `@react-pdf/renderer` (no headless browser), so it behaves the
+  same in dev, `next start`, and the container. CSV and the Module 3 Excel
+  workbook are unchanged and also honor the active filters.
 
 ### Service-history import (new template)
 - New "Service history" spreadsheet template backfills the service log from a

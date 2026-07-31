@@ -1,14 +1,104 @@
 "use client";
 /* Reports — CSBG Annual Report rollup preview (Module 3). Pixel port of
-   screens-reports.jsx; all data arrives pre-tallied from the server page. */
+   screens-reports.jsx; all data arrives pre-tallied from the server page.
+   Filters live in the URL (?period/programs/domains); the bar below pushes a
+   new querystring, the server re-runs the rollup, and every export link carries
+   the same scope so the download matches what's on screen. */
 import { useState } from "react";
-import { Chip, CodeChip, Kpi, Meter, PageHead, Panel } from "@/components/ui";
+import { useRouter } from "next/navigation";
+import { Chip, CodeChip, Kpi, Meter, Notice, PageHead, Panel } from "@/components/ui";
 import { Seg } from "@/components/ui-client";
 import { useToast } from "@/components/toast";
 import { I } from "@/components/icons";
 import { fmt } from "@/lib/format";
 import { fnpiStats, type MiniTableData, type ReportRollup } from "./types";
 import { addRomaGoal, removeRomaGoal } from "./actions";
+
+interface Opt { id: string; label: string }
+export interface FilterState {
+  preset: string;
+  from: string;
+  to: string;
+  programIds: string[];
+  domains: string[];
+  query: string;
+}
+
+/** Scope controls. Selections are staged locally, then "Apply" pushes a new
+    querystring so the server rollup re-runs; "Reset" returns to the federal view. */
+function FilterBar({ state, periodOptions, programOptions, domainOptions }: {
+  state: FilterState;
+  periodOptions: Opt[];
+  programOptions: Opt[];
+  domainOptions: Opt[];
+}) {
+  const router = useRouter();
+  const [preset, setPreset] = useState(state.preset);
+  const [from, setFrom] = useState(state.from);
+  const [to, setTo] = useState(state.to);
+  const [programIds, setProgramIds] = useState<string[]>(state.programIds);
+  const [domains, setDomains] = useState<string[]>(state.domains);
+
+  const apply = () => {
+    const qp = new URLSearchParams();
+    if (preset !== "current") qp.set("period", preset);
+    if (preset === "custom") { if (from) qp.set("from", from); if (to) qp.set("to", to); }
+    if (programIds.length) qp.set("programs", programIds.join(","));
+    if (domains.length) qp.set("domains", domains.join(","));
+    const qs = qp.toString();
+    router.push(qs ? `/reports?${qs}` : "/reports");
+  };
+  const reset = () => {
+    setPreset("current"); setFrom(""); setTo(""); setProgramIds([]); setDomains([]);
+    router.push("/reports");
+  };
+  const dirty = state.query !== (() => {
+    const qp = new URLSearchParams();
+    if (preset !== "current") qp.set("period", preset);
+    if (preset === "custom") { if (from) qp.set("from", from); if (to) qp.set("to", to); }
+    if (programIds.length) qp.set("programs", programIds.join(","));
+    if (domains.length) qp.set("domains", domains.join(","));
+    return qp.toString();
+  })();
+
+  const multi = (e: React.ChangeEvent<HTMLSelectElement>) => [...e.target.selectedOptions].map((o) => o.value);
+
+  return (
+    <Panel title="Filter the rollup" sub="Default is the full agency submission view. Narrowing by period, program, or service switches to a live-records-only analysis (pre-system baselines excluded).">
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, alignItems: "start" }}>
+        <div className="field">
+          <label>Reporting period</label>
+          <select value={preset} onChange={(e) => setPreset(e.target.value)}>
+            {periodOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </select>
+          {preset === "custom" ? (
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <input type="date" aria-label="From" value={from} onChange={(e) => setFrom(e.target.value)} />
+              <input type="date" aria-label="To" value={to} onChange={(e) => setTo(e.target.value)} />
+            </div>
+          ) : null}
+        </div>
+        <div className="field">
+          <label>Programs {programIds.length ? `(${programIds.length})` : ""}</label>
+          <select multiple size={5} value={programIds} onChange={(e) => setProgramIds(multi(e))}>
+            {programOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </select>
+        </div>
+        <div className="field">
+          <label>Service domains {domains.length ? `(${domains.length})` : ""}</label>
+          <select multiple size={5} value={domains} onChange={(e) => setDomains(multi(e))}>
+            {domainOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </select>
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center" }}>
+        <button className="calv-btn calv-btn--primary calv-btn--sm" onClick={apply} disabled={!dirty}>Apply filters</button>
+        <button className="calv-btn calv-btn--quiet calv-btn--sm" onClick={reset}>Reset to full view</button>
+        <span className="kbd-hint" style={{ marginLeft: "auto" }}>Ctrl/⌘-click to select multiple</span>
+      </div>
+    </Panel>
+  );
+}
 
 function MiniTable({ title, code, rows, total }: MiniTableData) {
   const max = Math.max(1, ...rows.map((r) => r.n));
@@ -37,10 +127,14 @@ function MiniTable({ title, code, rows, total }: MiniTableData) {
   );
 }
 
-export function ReportsClient({ data, canManageGoals, fnpiOptions }: {
+export function ReportsClient({ data, canManageGoals, fnpiOptions, filterState, periodOptions, programOptions, domainOptions }: {
   data: ReportRollup;
   canManageGoals: boolean;
   fnpiOptions: Array<{ code: string; label: string }>;
+  filterState: FilterState;
+  periodOptions: Opt[];
+  programOptions: Opt[];
+  domainOptions: Opt[];
 }) {
   const toast = useToast();
   const [tab, setTab] = useState("Characteristics");
@@ -60,8 +154,11 @@ export function ReportsClient({ data, canManageGoals, fnpiOptions }: {
   const { fy, agency, clientCount: n, readyPct } = data;
   const maxSrv = Math.max(1, ...data.srvByDomain.map((d) => d.count));
 
-  // real file downloads from the export route (CSV rollup / Annual Report packet)
-  const download = (url: string, msg: string) => {
+  // real file downloads from the export route — the active filter querystring
+  // is appended so every export matches the scope shown on screen.
+  const download = (path: string, msg: string) => {
+    const sep = path.includes("?") ? "&" : "?";
+    const url = filterState.query ? `${path}${sep}${filterState.query}` : path;
     const a = document.createElement("a");
     a.href = url;
     document.body.appendChild(a);
@@ -85,17 +182,28 @@ export function ReportsClient({ data, canManageGoals, fnpiOptions }: {
               Module 3 workbook (Excel)
             </button>
             <button className="calv-btn calv-btn--primary calv-btn--sm"
-              onClick={() => download("/reports/export?packet=1", "Annual Report packet drafted — Module 3 Sections A, B & C.")}>
-              <I name="doc" size={13} /> Draft Annual Report
+              onClick={() => download("/reports/export?packet=1", "Annual Report PDF drafted — Module 3 Sections A, B & C.")}>
+              <I name="doc" size={13} /> Draft Annual Report (PDF)
             </button>
           </div>
         }
       />
 
+      {data.live ? (
+        <Notice tone="warn" icon="alert">
+          <strong>Live records only.</strong> This filtered view counts purely from in-system records
+          and <strong>excludes the imported pre-system baseline</strong>, so the totals are lower than the
+          official submission figures. Scope: {data.fy.label}
+          {data.scopeNote ? ` · ${data.scopeNote}` : ""}. Reset to the full view for the numbers you file.
+        </Notice>
+      ) : null}
+
+      <FilterBar state={filterState} periodOptions={periodOptions} programOptions={programOptions} domainOptions={domainOptions} />
+
       <div className="kpis">
         <Kpi kick="Individuals served (unduplicated)" value={fmt(agency.individualsServed)} foot="Module 3 Sec. C, line A" />
         <Kpi kick="Households served (unduplicated)" value={fmt(agency.householdsServed)} foot="Module 3 Sec. C, line B" accent="var(--calv-teal)" />
-        <Kpi kick="New enrollments this FY" value={fmt(agency.newThisFY)} accent="var(--calv-sage)" />
+        <Kpi kick={data.live ? "New enrollments in period" : "New enrollments this FY"} value={fmt(agency.newThisFY)} accent="var(--calv-sage)" />
         <Kpi kick="Records report-ready" value={readyPct + "%"} foot={(100 - readyPct) + "% have Unknown / Not Reported fields"} tone="bad" accent="var(--calv-amber)" />
       </div>
 

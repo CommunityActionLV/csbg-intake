@@ -35,7 +35,7 @@ const nextConfig: NextConfig = {
   // standalone output only for container builds (Dockerfile sets BUILD_STANDALONE=1);
   // the Windows local tier runs `next start`, which standalone builds don't support
   output: process.env.BUILD_STANDALONE === "1" ? "standalone" : undefined,
-  serverExternalPackages: ["pg", "@electric-sql/pglite"],
+  serverExternalPackages: ["pg", "@electric-sql/pglite", "@react-pdf/renderer"],
   experimental: {
     serverActions: {
       // spreadsheet imports arrive base64-encoded through a server action (4 MB file cap)

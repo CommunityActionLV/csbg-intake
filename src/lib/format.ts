@@ -73,21 +73,47 @@ export const FY_START_MONTHS: Record<string, number> = { January: 0, April: 3, J
 export function currentFY(now = new Date(), fyStart = "October"): FiscalYear {
   const sm = FY_START_MONTHS[fyStart] ?? 9;
   const fy = sm === 0 || now.getMonth() < sm ? now.getFullYear() : now.getFullYear() + 1;
-  const startYear = sm === 0 ? fy : fy - 1;
-  const start = new Date(startYear, sm, 1);
-  const end = new Date(startYear + 1, sm, 0); // last day of the month before the next FY starts
+  return fiscalYearEndingIn(fy, fyStart, now);
+}
+
+/** Shared formatter: turn a [start, end] window into the FiscalYear shape.
+    `now` drives pctElapsed (clamped 0–100), so a window entirely in the past
+    reads 100% and one entirely in the future reads 0%. */
+function fyFromWindow(label: string, short: string, start: Date, end: Date, now: Date): FiscalYear {
   const pctElapsed = Math.min(100, Math.max(0,
     Math.round(((now.getTime() - start.getTime()) / (end.getTime() - start.getTime())) * 100)));
   const d = (x: Date) => x.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
   const md = (x: Date) => x.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   const iso = (x: Date) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
   return {
-    label: `FY ${fy}`,
-    short: `FY${String(fy).slice(2)}`,
+    label,
+    short,
     range: `${d(start)} – ${d(end)}`,
     shortRange: `${md(start)} – ${md(end)}`,
     start: iso(start),
     end: iso(end),
     pctElapsed,
   };
+}
+
+/** The fiscal year that ENDS in calendar year `endingYear` for an agency whose
+    FY starts in month `fyStart` — the building block behind currentFY() and the
+    Reports "prior year" period presets. */
+export function fiscalYearEndingIn(endingYear: number, fyStart = "October", now = new Date()): FiscalYear {
+  const sm = FY_START_MONTHS[fyStart] ?? 9;
+  const startYear = sm === 0 ? endingYear : endingYear - 1;
+  const start = new Date(startYear, sm, 1);
+  const end = new Date(startYear + 1, sm, 0); // last day of the month before the next FY starts
+  return fyFromWindow(`FY ${endingYear}`, `FY${String(endingYear).slice(2)}`, start, end, now);
+}
+
+/** An arbitrary reporting window from two ISO dates ("YYYY-MM-DD"), for the
+    Reports custom-range / calendar-YTD filters. Shares the FiscalYear shape so
+    the rollup, UI, and exports treat it like any other period. */
+export function customPeriod(startIso: string, endIso: string, now = new Date()): FiscalYear {
+  const parse = (s: string) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, (m ?? 1) - 1, d ?? 1); };
+  const start = parse(startIso);
+  const end = parse(endIso);
+  const d = (x: Date) => x.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  return fyFromWindow(`${d(start)} – ${d(end)}`, "Custom", start, end, now);
 }
