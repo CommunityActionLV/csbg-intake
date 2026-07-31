@@ -6,6 +6,16 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
 
 ## Unreleased — 0.5.0 (roadmap Phases 1–5)
 
+### Import templates: accepted-values key
+- Template downloads are now .xlsx workbooks with two sheets: the **Import**
+  sheet (headers + the skip-guaranteed example row — the only sheet the
+  upload parser reads) and an **Accepted values** key listing every accepted
+  value for each field with predetermined options: the AR 3.0 instrument
+  answers (sex, race, education, work, insurance, military, household type,
+  housing, income sources), Yes/No fields, income periods, the full service
+  taxonomy (code — label), and the agency's **live** program, staff, and
+  FPL-schedule lists at download time. Generated server-side (admin-only
+  route), so ExcelJS stays out of the client bundle.
 ### Reports: period/program/service filters + branded PDF
 - The Reports rollup can now be **filtered** by reporting period (current FY,
   a prior FY, calendar year-to-date, or a custom date range), by **program**,
