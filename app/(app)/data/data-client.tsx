@@ -8,7 +8,7 @@ import { Modal } from "@/components/ui-client";
 import { I } from "@/components/icons";
 import { useToast } from "@/components/toast";
 import { fmt } from "@/lib/format";
-import { IMPORT_TEMPLATES, autoMapColumns, importTemplate, templateCsv, type ImportTemplate, type ImportField } from "@/lib/import-templates";
+import { IMPORT_TEMPLATES, autoMapColumns, importTemplate, type ImportTemplate, type ImportField } from "@/lib/import-templates";
 import { parseImportFile, commitImport, undoImport, resolveMatchReview, type ImportSummary, type ReviewAction } from "./actions";
 import { INCOME_PERIODS } from "@/lib/income";
 
@@ -331,20 +331,6 @@ function FixedValueInput({ field, programs, fplYears, services, value, onChange 
 
 /* ---------- Import wizard: template → upload → map columns → results ---------- */
 
-/** Save a blank CSV for a template: exact headers + one example row the
-    importer skips if it's left in. BOM so Excel opens it as UTF-8. */
-function downloadTemplate(tp: ImportTemplate) {
-  const blob = new Blob(["\uFEFF" + templateCsv(tp)], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `cap-trellis-import-${tp.id}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
 type WizardStep = "pick" | "map" | "done";
 
 function ImportWizard({ onClose, toast, programs, fplYears, services }: {
@@ -439,10 +425,10 @@ function ImportWizard({ onClose, toast, programs, fplYears, services }: {
           </div>
           <div style={{ display: "flex", gap: 6, alignItems: "baseline", flexWrap: "wrap", fontSize: 12, color: "var(--calv-slate-65)", marginBottom: 14 }}>
             <I name="doc" size={12} style={{ alignSelf: "center" }} />
-            <span>Blank templates (CSV, with an example row to replace):</span>
+            <span>Blank templates (XLSX — headers, an example row to replace, and an Accepted-values key sheet):</span>
             {IMPORT_TEMPLATES.map((tp, i) => (
               <span key={tp.id}>
-                <a className="tlink" style={{ cursor: "pointer" }} onClick={() => downloadTemplate(tp)}>{tp.name}</a>
+                <a className="tlink" href={"/data/template/" + tp.id}>{tp.name}</a>
                 {i < IMPORT_TEMPLATES.length - 1 ? <span style={{ color: "var(--calv-slate-35)" }}> · </span> : null}
               </span>
             ))}
