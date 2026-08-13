@@ -7,6 +7,8 @@ import { getFplHistory } from "@/lib/fpl";
 import { importTemplate } from "@/lib/import-templates";
 import { localDateOf, shortDate } from "@/lib/format";
 import { DataClient, type MatchingStats, type ReviewRow } from "./data-client";
+import { HmisPanel, type HmisReviewItem, type HmisSyncStats } from "./hmis-panel";
+import { hmisConfigured } from "@/lib/hmis";
 
 export default async function DataPage() {
   await requireAdmin();
@@ -68,7 +70,38 @@ export default async function DataPage() {
       canUndo: j.template === "clients",
     }));
 
+  // PA HMIS panel — sync state, pending link/dismiss reviews
+  const hmisStats = await kvGet<HmisSyncStats>("hmisSync",
+    { at: null, pulled: 0, alreadyLinked: 0, autoLinked: 0, queued: 0, unlinked: 0 });
+  const hmisPending = await db.select().from(t.hmisReviews).where(eq(t.hmisReviews.status, "pending"));
+  const hmisSnapshot = new Map(
+    (await db.select().from(t.hmisClients)).map((h) => [h.hmisId, h]));
+  const hmisCandidateIds = [...new Set(hmisPending.flatMap((r) => r.candidateIds))];
+  const hmisCandidates = hmisCandidateIds.length > 0
+    ? await db.select({
+        id: t.clients.id, first: t.clients.first, last: t.clients.last,
+        dob: t.clients.dob, phone: t.clients.phone,
+      }).from(t.clients).where(inArray(t.clients.id, hmisCandidateIds))
+    : [];
+  const hmisCandidateById = new Map(hmisCandidates.map((c) => [c.id, c]));
+  const hmisReviews: HmisReviewItem[] = hmisPending
+    .map((r) => {
+      const h = hmisSnapshot.get(r.hmisId);
+      if (!h) return null; // snapshot row replaced away — stale review, hidden
+      return {
+        id: r.id,
+        when: shortDate(localDateOf(r.at)),
+        person: { name: `${h.first} ${h.last}`, dob: h.dob ?? "", phone: h.phone ?? "", email: h.email ?? "" },
+        candidates: r.candidateIds
+          .map((id) => hmisCandidateById.get(id))
+          .filter((c): c is NonNullable<typeof c> => !!c)
+          .map((c) => ({ id: c.id, name: `${c.first} ${c.last}`, dob: c.dob, phone: c.phone ?? "" })),
+      };
+    })
+    .filter((r): r is HmisReviewItem => r !== null);
+
   return (
+    <>
     <DataClient
       integrations={integrations.map((x) => ({
         id: x.id,
@@ -86,5 +119,7 @@ export default async function DataPage() {
       fplYears={fplYears}
       services={services}
     />
+    <HmisPanel configured={hmisConfigured()} stats={hmisStats} reviews={hmisReviews} />
+    </>
   );
 }

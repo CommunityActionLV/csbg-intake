@@ -6,6 +6,24 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
 
 ## Unreleased — 0.5.0 (roadmap Phases 1–5)
 
+### PA HMIS sync (MOU-scoped)
+- **[compliance]** Live PA HMIS (Eccovia ClientTrack/CaseWorthy) integration,
+  built strictly to the signed PA DCED MOU: data pulled for CACLV-owned
+  projects is used ONLY for (a) dedup matching and (b) deidentified aggregate
+  organization-wide reports — the sync **never writes to client records**.
+- Admin-only `hmis_clients` snapshot (full-replace per sync), OAuth2
+  client-credentials adapter configured via `HMIS_*` environment settings,
+  field-name-tolerant normalization, Test connection + Run sync on Data &
+  Integrations.
+- Matching pass: known links by HMIS Client ID → exact name+DOB auto-link
+  (audited) → near matches held in a link/dismiss review queue (no
+  "create client" option — the MOU doesn't permit it; dismissals stick).
+- /reports gains "Organization-wide unduplicated · with PA HMIS": Trellis
+  total, HMIS total, matched overlap counted once, HMIS-only, unduplicated
+  org-wide total. Counts only, no identifying fields.
+- `docs/compliance/hmis-api-integration-profile.md` rewritten to the signed
+  MOU, including the use-restriction warning and file-disposition procedure.
+
 ### Import templates: accepted-values key
 - Template downloads are now .xlsx workbooks with two sheets: the **Import**
   sheet (headers + the skip-guaranteed example row — the only sheet the

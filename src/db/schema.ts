@@ -352,6 +352,42 @@ export interface HeldClientPayload {
   externalId?: { system: string; id: string };
 }
 
+/* ---------- PA HMIS sync (MOU-scoped) ----------
+   Snapshot of HMIS clients pulled for CACLV-owned projects. Per the signed
+   MOU its ONLY permitted uses are (a) data-set matching for deduplication
+   and (b) deidentified aggregate organization-wide reports. It must never
+   populate client records or drive intake/outreach. Admin-only surface. */
+export const hmisClients = pgTable("hmis_clients", {
+  hmisId: text("hmis_id").primaryKey(),         // HMIS Client ID (the durable link key)
+  first: text("first").notNull(),
+  last: text("last").notNull(),
+  dob: text("dob"),                             // ISO date when provided
+  email: text("email"),                         // matching tiebreaker only
+  phone: text("phone"),                         // matching tiebreaker only
+  sex: text("sex"),                             // gender/sex as HMIS reports it
+  race: text("race"),                           // race + ethnicity, combined text
+  veteran: text("veteran"),
+  insurance: text("insurance"),
+  incomeSrc: text("income_src"),
+  nonCash: text("non_cash"),                    // non-cash benefits, as reported
+  services: jsonb("services").$type<Array<{ name: string; date: string }>>().notNull().default([]),
+  household: jsonb("household").$type<Array<{ first: string; last: string; dob: string | null }>>().notNull().default([]),
+  fetchedAt: text("fetched_at").notNull(),      // ISO datetime of the sync that wrote this row
+});
+
+// HMIS near-matches held for human review — link or dismiss, never create.
+export const hmisReviews = pgTable("hmis_reviews", {
+  id: integer("id").primaryKey().generatedByDefaultAsIdentity(),
+  at: text("at").notNull(),                     // ISO datetime queued
+  hmisId: text("hmis_id").notNull(),
+  candidateIds: jsonb("candidate_ids").$type<string[]>().notNull().default([]),
+  status: text("status").notNull().default("pending"), // 'pending' | 'resolved'
+  resolution: text("resolution"),               // 'linked' | 'dismissed'
+  resolvedClientId: text("resolved_client_id"),
+  resolvedBy: text("resolved_by"),
+  resolvedAt: text("resolved_at"),
+});
+
 // Duplicate review queue — incoming records whose match against existing
 // clients is ambiguous. Nothing merges silently; a human resolves each row.
 export const matchReviews = pgTable("match_reviews", {
