@@ -1,23 +1,26 @@
 "use client";
-/* PA HMIS sync panel — status, sync controls, and the link/dismiss match
-   queue. MOU-scoped: matching + deidentified aggregates only, so the panel
-   never offers "create a client" and shows no more identity than a reviewer
-   needs to compare records. */
+/* PA HMIS sync panel — enrollment-program setting, sync controls, and the
+   match queue (link / import as new client / dismiss). Per the CACLV ↔ PA
+   HMIS operating understanding, synced records feed internal tracking &
+   reporting: dedup-linked, blank-filled, and imported into the directory. */
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Chip, Empty, Panel } from "@/components/ui";
 import { I } from "@/components/icons";
 import { useToast } from "@/components/toast";
 import { fmt } from "@/lib/format";
-import { resolveHmisReview, runHmisSync, testHmisConnection } from "./hmis-actions";
+import { resolveHmisReview, runHmisSync, setHmisProgram, testHmisConnection } from "./hmis-actions";
 
 export interface HmisSyncStats {
   at: string | null;        // ISO datetime of last sync (null = never)
   pulled: number;
   alreadyLinked: number;
   autoLinked: number;
+  enriched: number;
+  created: number;
   queued: number;
-  unlinked: number;
+  noDob: number;
+  noProgram: number;
 }
 
 export interface HmisReviewItem {
@@ -27,10 +30,12 @@ export interface HmisReviewItem {
   candidates: Array<{ id: string; name: string; dob: string; phone: string }>;
 }
 
-export function HmisPanel({ configured, stats, reviews }: {
+export function HmisPanel({ configured, stats, reviews, programs, programId }: {
   configured: boolean;
   stats: HmisSyncStats;
   reviews: HmisReviewItem[];
+  programs: Array<{ id: string; name: string }>;
+  programId: string | null;
 }) {
   const toast = useToast();
   const router = useRouter();
@@ -50,7 +55,15 @@ export function HmisPanel({ configured, stats, reviews }: {
       if (res.ok) router.refresh();
     });
   }
-  function onResolve(id: number, action: { type: "link"; clientId: string } | { type: "dismiss" }) {
+  function onProgram(id: string) {
+    if (!id) return;
+    startTransition(async () => {
+      const res = await setHmisProgram(id);
+      toast(res.message);
+      if (res.ok) router.refresh();
+    });
+  }
+  function onResolve(id: number, action: { type: "link"; clientId: string } | { type: "create" } | { type: "dismiss" }) {
     setBusyReview(id);
     startTransition(async () => {
       const res = await resolveHmisReview(id, action);
@@ -63,7 +76,7 @@ export function HmisPanel({ configured, stats, reviews }: {
   return (
     <Panel
       title="PA HMIS sync"
-      sub="Per the signed PA DCED MOU: HMIS data is used ONLY to deduplicate across systems and build deidentified organization-wide totals — it never fills client records."
+      sub="Pulls CACLV-project records from PA HMIS for internal tracking & reporting: matched people are deduplicated (blank fields filled — local data always wins), new people import into the client directory, and totals roll into the org-wide unduplicated report."
       right={
         <div style={{ display: "flex", gap: 8 }}>
           <button className="calv-btn calv-btn--quiet calv-btn--sm" disabled={pending} onClick={onTest}>Test connection</button>
@@ -82,18 +95,30 @@ export function HmisPanel({ configured, stats, reviews }: {
           Not configured yet — add HMIS_TOKEN_URL, HMIS_CLIENT_ID, HMIS_CLIENT_SECRET, and HMIS_BASE_URL to .env.local (never commit them), restart the server, then Test connection.
         </Empty>
       ) : (
+        <>
+        <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", marginBottom: 12, fontSize: 12.5 }}>
+          <span style={{ color: "var(--calv-slate-65)" }}>New HMIS people enroll into:</span>
+          <select value={programId ?? ""} disabled={pending} onChange={(e) => onProgram(e.target.value)} style={{ maxWidth: 280 }} aria-label="HMIS enrollment program">
+            <option value="">— pick a program —</option>
+            {programs.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          {!programId ? <Chip tone="amber">required before imports run</Chip> : null}
+        </div>
         <div style={{ display: "flex", gap: 22, fontSize: 12.5, color: "var(--calv-slate-65)", flexWrap: "wrap", marginBottom: reviews.length ? 14 : 0 }}>
           {stats.at ? (
             <>
               <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.pulled)}</strong> HMIS records last sync</span>
-              <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.alreadyLinked + stats.autoLinked)}</strong> linked to Trellis records</span>
-              <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.unlinked)}</strong> HMIS-only</span>
+              <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.created)}</strong> imported as clients</span>
+              <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.alreadyLinked + stats.autoLinked)}</strong> linked (deduplicated)</span>
+              <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.enriched)}</strong> blank-filled</span>
               <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(reviews.length)}</strong> awaiting review</span>
+              {stats.noDob > 0 ? <span><strong style={{ fontWeight: 600, color: "var(--calv-slate)" }}>{fmt(stats.noDob)}</strong> snapshot-only (no DOB)</span> : null}
             </>
           ) : (
             <span>Configured — run the first sync to pull the CACLV-project snapshot.</span>
           )}
         </div>
+        </>
       )}
 
       {reviews.map((r) => (
@@ -123,10 +148,14 @@ export function HmisPanel({ configured, stats, reviews }: {
               ))}
             </tbody>
           </table>
-          <div style={{ marginTop: 8, textAlign: "right" }}>
+          <div style={{ marginTop: 8, display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button className="calv-btn calv-btn--quiet calv-btn--sm" disabled={pending && busyReview === r.id}
+              onClick={() => onResolve(r.id, { type: "create" })}>
+              Different person — import as new client
+            </button>
             <button className="calv-btn calv-btn--quiet calv-btn--sm" disabled={pending && busyReview === r.id}
               onClick={() => onResolve(r.id, { type: "dismiss" })}>
-              Not the same person
+              Dismiss — keep out of the directory
             </button>
           </div>
         </div>

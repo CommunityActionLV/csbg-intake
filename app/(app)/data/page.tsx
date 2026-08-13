@@ -72,7 +72,8 @@ export default async function DataPage() {
 
   // PA HMIS panel — sync state, pending link/dismiss reviews
   const hmisStats = await kvGet<HmisSyncStats>("hmisSync",
-    { at: null, pulled: 0, alreadyLinked: 0, autoLinked: 0, queued: 0, unlinked: 0 });
+    { at: null, pulled: 0, alreadyLinked: 0, autoLinked: 0, enriched: 0, created: 0, queued: 0, noDob: 0, noProgram: 0 });
+  const hmisProgramId = await kvGet<string | null>("hmisProgramId", null);
   const hmisPending = await db.select().from(t.hmisReviews).where(eq(t.hmisReviews.status, "pending"));
   const hmisSnapshot = new Map(
     (await db.select().from(t.hmisClients)).map((h) => [h.hmisId, h]));
@@ -119,7 +120,13 @@ export default async function DataPage() {
       fplYears={fplYears}
       services={services}
     />
-    <HmisPanel configured={hmisConfigured()} stats={hmisStats} reviews={hmisReviews} />
+    <HmisPanel
+      configured={hmisConfigured()}
+      stats={hmisStats}
+      reviews={hmisReviews}
+      programs={programs.map((p) => ({ id: p.id, name: p.name }))}
+      programId={hmisProgramId}
+    />
     </>
   );
 }

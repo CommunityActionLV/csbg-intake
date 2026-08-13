@@ -1,15 +1,16 @@
 "use server";
-/* PA HMIS sync actions — admin-only, MOU-scoped (dedup matching +
-   deidentified aggregates; never writes to the clients table). */
+/* PA HMIS sync actions — admin-only. Per the CACLV ↔ PA HMIS operating
+   understanding, synced records feed internal tracking & reporting:
+   dedup-linked, blank-filled, and imported into the client directory. */
 import { revalidatePath } from "next/cache";
 import { eq } from "drizzle-orm";
 import { db, t } from "@/db";
 import { requireAdmin } from "@/lib/auth";
 import { audit } from "@/lib/access";
-import { kvSet } from "@/lib/data/core";
+import { kvGet, kvSet, nextClientId } from "@/lib/data/core";
 import { fmt, shortDate, todayIso } from "@/lib/format";
 import {
-  fetchHmisClients, hmisConfig, hmisToken, runHmisMatching,
+  createClientFromHmis, fetchHmisClients, hmisConfig, hmisToken, runHmisMatching,
 } from "@/lib/hmis";
 
 export interface HmisActionResult { ok: boolean; message: string }
@@ -31,9 +32,20 @@ export async function testHmisConnection(): Promise<HmisActionResult> {
   return { ok: true, message: "Connected — PA HMIS accepted the credentials." };
 }
 
+/** Set the program HMIS-imported clients enroll into. */
+export async function setHmisProgram(programId: string): Promise<HmisActionResult> {
+  const user = await requireAdmin();
+  const program = (await db.select().from(t.programs).where(eq(t.programs.id, programId)))[0];
+  if (!program || program.active !== 1) return { ok: false, message: "Pick an active program." };
+  await kvSet("hmisProgramId", programId);
+  await audit(user.id, "hmis.program.set", "integration", "hmis", `HMIS imports enroll into ${program.name}`);
+  revalidatePath("/data");
+  return { ok: true, message: `HMIS imports will enroll into ${program.name}.` };
+}
+
 /** Pull the CACLV-project snapshot, refresh hmis_clients wholesale, and run
-    the dedup matching pass. Snapshot data is admin-only and is used solely
-    for matching + deidentified aggregates, per the signed MOU. */
+    the integration pass: link, fill blanks, queue near matches, and import
+    unmatched people as client records (internal tracking & reporting). */
 export async function runHmisSync(): Promise<HmisActionResult> {
   const user = await requireAdmin();
   const cfg = hmisConfig();
@@ -58,26 +70,33 @@ export async function runHmisSync(): Promise<HmisActionResult> {
     await db.insert(t.hmisClients).values(rows.slice(i, i + CHUNK).map((r) => ({ ...r, fetchedAt: now })));
   }
 
-  const stats = await runHmisMatching(rows, user.id);
+  const programId = await kvGet<string | null>("hmisProgramId", null);
+  const stats = await runHmisMatching(rows, user.id, programId, nextClientId);
   await kvSet("hmisSync", { at: now, pulled: rows.length, ...stats });
   await db.update(t.integrations)
     .set({ status: "connected", lastSync: shortDate(todayIso()), records: `${fmt(rows.length)} HMIS records` })
     .where(eq(t.integrations.id, "hmis"));
   await audit(user.id, "hmis.sync", "integration", "hmis",
-    `${fmt(rows.length)} pulled — ${stats.alreadyLinked} already linked, ${stats.autoLinked} auto-linked (exact name+DOB), ${stats.queued} queued for review, ${stats.unlinked} HMIS-only`);
+    `${fmt(rows.length)} pulled — ${stats.alreadyLinked} already linked, ${stats.autoLinked} auto-linked, ${stats.enriched} blank-filled, ${stats.created} imported as clients, ${stats.queued} queued for review${stats.noDob ? `, ${stats.noDob} without DOB` : ""}${stats.noProgram ? `, ${stats.noProgram} skipped (no enrollment program set)` : ""}`);
   revalidatePath("/data");
   revalidatePath("/reports");
-  return {
-    ok: true,
-    message: `Synced ${fmt(rows.length)} HMIS records — ${stats.autoLinked} auto-linked, ${stats.queued} need review, ${fmt(stats.unlinked)} HMIS-only.`,
-  };
+  revalidatePath("/clients");
+  const parts = [
+    `${fmt(stats.created)} imported as new clients`,
+    `${fmt(stats.autoLinked)} auto-linked`,
+    `${fmt(stats.enriched)} records blank-filled`,
+    `${fmt(stats.queued)} need review`,
+  ];
+  if (stats.noProgram > 0) parts.push(`${fmt(stats.noProgram)} skipped — set the enrollment program`);
+  if (stats.noDob > 0) parts.push(`${fmt(stats.noDob)} kept snapshot-only (no DOB)`);
+  return { ok: true, message: `Synced ${fmt(rows.length)} HMIS records — ${parts.join(", ")}.` };
 }
 
-/** Resolve a held HMIS near-match: link to a candidate, or dismiss (not the
-    same person). Never creates a client record — the MOU does not allow it. */
+/** Resolve a held HMIS near-match: link to a candidate, import as a new
+    client record, or dismiss (not the same person, keep snapshot-only). */
 export async function resolveHmisReview(
   reviewId: number,
-  action: { type: "link"; clientId: string } | { type: "dismiss" },
+  action: { type: "link"; clientId: string } | { type: "create" } | { type: "dismiss" },
 ): Promise<HmisActionResult> {
   const user = await requireAdmin();
   const review = (await db.select().from(t.hmisReviews).where(eq(t.hmisReviews.id, reviewId)))[0];
@@ -101,11 +120,29 @@ export async function resolveHmisReview(
     return { ok: true, message: `Linked — this HMIS record now counts as the same person as ${action.clientId}.` };
   }
 
+  if (action.type === "create") {
+    const row = (await db.select().from(t.hmisClients).where(eq(t.hmisClients.hmisId, review.hmisId)))[0];
+    if (!row) return { ok: false, message: "This HMIS record is no longer in the snapshot — run a sync first." };
+    if (!row.dob) return { ok: false, message: "This HMIS record has no date of birth — it can't become a client record yet." };
+    const programId = await kvGet<string | null>("hmisProgramId", null);
+    if (!programId) return { ok: false, message: "Set the HMIS enrollment program first (above)." };
+    const clientId = await createClientFromHmis({ ...row, services: row.services, household: row.household }, programId, user.id, nextClientId);
+    if (!clientId) return { ok: false, message: "Could not create the record." };
+    await db.update(t.hmisReviews)
+      .set({ status: "resolved", resolution: "created", resolvedClientId: clientId, resolvedBy: user.id, resolvedAt: now })
+      .where(eq(t.hmisReviews.id, reviewId));
+    await audit(user.id, "hmis.create", "client", clientId, `Imported from HMIS on review (queue #${reviewId})`);
+    revalidatePath("/data");
+    revalidatePath("/reports");
+    revalidatePath("/clients");
+    return { ok: true, message: `Imported as new client record ${clientId}.` };
+  }
+
   await db.update(t.hmisReviews)
     .set({ status: "resolved", resolution: "dismissed", resolvedBy: user.id, resolvedAt: now })
     .where(eq(t.hmisReviews.id, reviewId));
   await audit(user.id, "hmis.dismiss", "hmis_review", String(reviewId), "Marked as not the same person");
   revalidatePath("/data");
   revalidatePath("/reports");
-  return { ok: true, message: "Dismissed — these count as two different people in the unduplicated totals." };
+  return { ok: true, message: "Dismissed — kept snapshot-only; these count as two different people." };
 }

@@ -10,22 +10,26 @@ organization-wide unduplicated aggregate are **built**. Remaining: pin the
 exact endpoint paths/paging/field names against the Eccovia API docs
 (<https://apidoc.eccovia.com>) and run the first production sync.
 
-## Permitted use — READ THIS FIRST
+## Permitted use — the operating understanding
 
-The signed MOU restricts use of the shared data **exclusively** to:
+Scope is limited to data entered by and for **CACLV-owned projects**. Per the
+operating understanding between CACLV and PA HMIS (confirmed by the Homeless
+Program Manager with the HMIS engineer who built the API's stored procedure):
+the shared elements are pulled into CAP Trellis — a **private, internal-only
+system** — for CACLV's internal tracking and reporting. That includes
+importing contact information and demographics into client records. The
+MOU's "deduplication" language refers to the HMIS-side stored procedure,
+which returns **pre-deduplicated result sets**; on our side the matching
+engine additionally deduplicates against the existing client directory so
+nobody is double-counted.
 
-1. **Data-set matching for deduplication**, and
-2. **Deidentified aggregate organization-wide reports.**
-
-Scope is limited to data entered by and for **CACLV-owned projects**.
-
-The system enforces this: the sync **never writes to the `clients` table** —
-no intake prefill, no contact-info reuse, no record creation from HMIS data.
-Its only outputs are the admin-only `hmis_clients` snapshot, durable ID links
-in `client_external_ids` (system = `hmis`), the `hmis_reviews` queue, and
-aggregate counts on /reports. The earlier ambition of eliminating double
-entry at intake **exceeds the signed terms** — pursue an MOU amendment before
-building anything that copies HMIS elements into client records.
+Standing obligations either way: the data is never redisclosed, never used
+outside the agency, stored securely with access limited to staff working on
+this (admin-gated), and electronic-file disposition is coordinated with
+PA DCED (procedure below). *Housekeeping note:* the MOU's written
+"exclusively … deidentified aggregate reports" sentence is narrower than
+this operating understanding — worth asking DCED to align the text at the
+next revision so a monitoring review reads the same way both parties do.
 
 ## Data elements (per signed MOU) → where they land
 
@@ -46,17 +50,27 @@ building anything that copies HMIS elements into client records.
 
 **No SSN in any form.** The MOU excludes it; the system stores none.
 
-## Matching & de-duplication policy (as built)
+## Sync behavior (as built)
 
-1. **Linked records:** exact `client_external_ids` (system `hmis`) match —
-   every sync after first linkage. Unambiguous, no fuzzy logic.
-2. **Exact identity** (normalized name + DOB, single candidate): auto-link,
-   audited (`hmis.link` on sync as auto-link detail).
-3. **Near matches** (shared engine, `src/lib/matching.ts`): held in
-   `hmis_reviews` — resolutions are **link** or **dismiss** only (never
-   "create a client"; the MOU does not permit it). Dismissals stick across
-   syncs. Every resolution is audited.
-4. Email/phone are tiebreaker signals in review, never primary keys.
+Per HMIS person, each sync:
+
+1. **Already linked** (`client_external_ids`, system `hmis`): fill **blank**
+   fields on the linked record — phone, sex, race, veteran/military,
+   insurance, income source, email (stored in `custom.email`). **Local data
+   always wins**; nothing non-empty is ever overwritten.
+2. **Exact identity** (normalized name + DOB, single candidate): auto-link
+   (audited) + the same blank-fill.
+3. **Near matches** (shared engine, `src/lib/matching.ts`; email/phone are
+   tiebreakers, never keys): held in `hmis_reviews` — resolutions are
+   **link**, **import as new client**, or **dismiss** (keep snapshot-only).
+   Dismissals stick across syncs. Every resolution is audited.
+4. **No match:** imported as a new client record — enrolled into the
+   configured HMIS program (Data page setting), flagged
+   "HMIS import — verify income & eligibility data" (HMIS supplies no income
+   figure, so imports land at $0 income and must be verified before any
+   eligibility determination), `hhSize` derived from the family-members
+   list, FPL year pinned to the active schedule. Requires a DOB
+   (`clients.dob` is NOT NULL) — DOB-less records stay snapshot-only.
 
 ## Aggregates (as built)
 

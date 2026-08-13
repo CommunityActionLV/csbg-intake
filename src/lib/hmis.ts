@@ -1,18 +1,32 @@
 import { and, eq } from "drizzle-orm";
 import { db, t } from "@/db";
 import { classifyMatches, matchKey } from "@/lib/matching";
+import { canonicalCharacteristic } from "@/lib/csbg-catalog";
+import { getActiveFpl } from "@/lib/fpl";
+
+/* ID allocation lives in @/lib/data/core, which imports Next's `server-only`
+   and therefore can't be imported from this (unit-testable) module — the
+   caller passes the allocator in instead. */
+export type ClientIdAllocator = () => Promise<string>;
 
 /* ============================================================
-   PA HMIS (Eccovia ClientTrack/CaseWorthy) sync — MOU-scoped.
+   PA HMIS (Eccovia ClientTrack/CaseWorthy) sync.
 
-   The signed PA DCED MOU (effective 2026-07-01) permits pulling the
-   named data elements for CACLV-owned projects and restricts USE to:
-     (a) data-set matching for deduplication, and
-     (b) deidentified aggregate organization-wide reports.
-   Accordingly this module NEVER writes to the clients table. Its only
-   outputs are the hmis_clients snapshot (admin-only), durable ID links
-   in client_external_ids (system = 'hmis'), the hmis_reviews queue,
-   and aggregate counts. No intake prefill, no outreach use.
+   Governed by the signed PA DCED MOU (effective 2026-07-01) and the
+   parties' operating understanding (CACLV ↔ PA HMIS): the named data
+   elements for CACLV-owned projects are pulled into this private,
+   internal-only system for CACLV's internal tracking and reporting —
+   deduplicated against the client directory, imported into client
+   records, and rolled into deidentified organization-wide aggregates.
+   The data is never redisclosed and never used outside the agency.
+
+   Sync behavior per HMIS person:
+     already linked        → fill blank fields on the linked record
+     exact name+DOB match  → auto-link (audited) + fill blanks
+     near match            → hmis_reviews queue (link / create / dismiss)
+     no match              → create a client record in the configured
+                             HMIS program (needs a DOB; else snapshot-only)
+   Local data always wins: enrichment fills ONLY empty fields.
 
    Credentials/endpoints come from the environment (.env.local on the
    local tier — the data folder and machine are password-protected per
@@ -187,23 +201,89 @@ export async function fetchHmisClients(cfg: HmisConfig, token: string): Promise<
   return out;
 }
 
-/* ---------- matching pass (dedup — the MOU's first permitted use) ---------- */
+/* ---------- integration pass: dedup, enrich, import ---------- */
 
 export interface HmisMatchStats {
   alreadyLinked: number;
   autoLinked: number;
-  queued: number;
-  unlinked: number;
+  enriched: number;     // linked records that had blank fields filled
+  created: number;      // new client records imported from HMIS
+  queued: number;       // near matches held for review
+  noDob: number;        // unmatched but missing a DOB — snapshot-only
+  noProgram: number;    // unmatched but no enrollment program configured
 }
 
-/** Match unlinked snapshot rows against the client directory.
-    Exact name+DOB → auto-link (audited by the caller); near matches →
-    hmis_reviews for a human; everything else stays unlinked. */
-export async function runHmisMatching(rows: HmisClientRow[], linkedBy: string): Promise<HmisMatchStats> {
+const canonOr = (code: string, v: string | null): string | null =>
+  v === null || v === "" ? null : canonicalCharacteristic(code, v) ?? v;
+
+/** Fill BLANK fields on a linked client from its HMIS record — local data
+    always wins; nothing non-empty is ever overwritten. Returns true when
+    anything changed. */
+export async function enrichLinkedClient(clientId: string, row: HmisClientRow): Promise<boolean> {
+  const client = (await db.select().from(t.clients).where(eq(t.clients.id, clientId)))[0];
+  if (!client) return false;
+  const set: Record<string, unknown> = {};
+  if (!client.phone && row.phone) set.phone = row.phone;
+  if (!client.sex && row.sex) set.sex = canonOr("C1", row.sex);
+  if (!client.race && row.race) set.race = canonOr("C6", row.race);
+  if (!client.military && row.veteran) set.military = canonOr("C7", row.veteran);
+  if (!client.insurance && row.insurance) set.insurance = canonOr("C5b-source", row.insurance);
+  if (!client.incomeSrc && row.incomeSrc) set.incomeSrc = canonOr("D13", row.incomeSrc);
+  if (row.email && !client.custom?.email) set.custom = { ...client.custom, email: row.email };
+  if (Object.keys(set).length === 0) return false;
+  await db.update(t.clients).set(set).where(eq(t.clients.id, clientId));
+  return true;
+}
+
+/** Import one HMIS person as a new client record (internal tracking &
+    reporting). Requires a DOB (clients.dob is NOT NULL). Links the HMIS ID. */
+export async function createClientFromHmis(
+  row: HmisClientRow, programId: string, userId: string, allocateId: ClientIdAllocator,
+): Promise<string | null> {
+  if (!row.dob) return null;
   const now = new Date().toISOString();
-  const linked = new Set(
+  const active = await getActiveFpl();
+  const serviceDates = row.services.map((s) => s.date).filter(Boolean).sort();
+  const clientId = await allocateId();
+  await db.insert(t.clients).values({
+    id: clientId,
+    first: row.first,
+    last: row.last,
+    dob: row.dob,
+    phone: row.phone,
+    sex: canonOr("C1", row.sex),
+    race: canonOr("C6", row.race),
+    military: canonOr("C7", row.veteran),
+    insurance: canonOr("C5b-source", row.insurance),
+    incomeSrc: canonOr("D13", row.incomeSrc),
+    hhSize: Math.min(12, Math.max(1, row.household.length + 1)),
+    income: 0,
+    caseworkerId: userId,
+    enrolled: serviceDates[0] ?? now.slice(0, 10),
+    fplYear: active.year,
+    nextFollowUp: null,
+    flags: ["HMIS import — verify income & eligibility data"],
+    custom: row.email ? { email: row.email } : {},
+    status: "active",
+    createdAt: now,
+  });
+  await db.insert(t.clientPrograms).values({ clientId, programId });
+  await db.insert(t.clientExternalIds)
+    .values({ system: "hmis", externalId: row.hmisId, clientId, linkedAt: now, linkedBy: userId })
+    .onConflictDoNothing();
+  return clientId;
+}
+
+/** The full integration pass over a fresh snapshot: link, enrich, queue,
+    and import. `programId` is the enrollment program for created records
+    (null = skip creation and count what it would have imported). */
+export async function runHmisMatching(
+  rows: HmisClientRow[], linkedBy: string, programId: string | null, allocateId: ClientIdAllocator,
+): Promise<HmisMatchStats> {
+  const now = new Date().toISOString();
+  const linkedTo = new Map(
     (await db.select().from(t.clientExternalIds).where(eq(t.clientExternalIds.system, "hmis")))
-      .map((r) => r.externalId));
+      .map((r) => [r.externalId, r.clientId]));
   const reviewed = new Set(
     (await db.select({ hmisId: t.hmisReviews.hmisId }).from(t.hmisReviews)).map((r) => r.hmisId));
   const candidates = await db.select({
@@ -216,18 +296,26 @@ export async function runHmisMatching(rows: HmisClientRow[], linkedBy: string): 
     byKey.set(k, [...(byKey.get(k) ?? []), c.id]);
   }
 
-  const stats: HmisMatchStats = { alreadyLinked: 0, autoLinked: 0, queued: 0, unlinked: 0 };
+  const stats: HmisMatchStats = {
+    alreadyLinked: 0, autoLinked: 0, enriched: 0, created: 0, queued: 0, noDob: 0, noProgram: 0,
+  };
   for (const row of rows) {
-    if (linked.has(row.hmisId)) { stats.alreadyLinked++; continue; }
-    // exact identity (name + DOB) — unambiguous, auto-link
+    const existing = linkedTo.get(row.hmisId);
+    if (existing) {
+      stats.alreadyLinked++;
+      if (await enrichLinkedClient(existing, row)) stats.enriched++;
+      continue;
+    }
+    // exact identity (name + DOB) — unambiguous, auto-link + enrich
     if (row.dob) {
       const exact = byKey.get(matchKey({ first: row.first, last: row.last, dob: row.dob })) ?? [];
       if (exact.length === 1) {
         await db.insert(t.clientExternalIds)
           .values({ system: "hmis", externalId: row.hmisId, clientId: exact[0], linkedAt: now, linkedBy })
           .onConflictDoNothing();
-        linked.add(row.hmisId);
+        linkedTo.set(row.hmisId, exact[0]);
         stats.autoLinked++;
+        if (await enrichLinkedClient(exact[0], row)) stats.enriched++;
         continue;
       }
     }
@@ -243,8 +331,19 @@ export async function runHmisMatching(rows: HmisClientRow[], linkedBy: string): 
         stats.queued++;
         continue;
       }
+      // no match anywhere → import as a new client record
+      if (!row.dob) { stats.noDob++; continue; }
+      if (!programId) { stats.noProgram++; continue; }
+      const created = await createClientFromHmis(row, programId, linkedBy, allocateId);
+      if (created) {
+        linkedTo.set(row.hmisId, created);
+        byKey.set(matchKey({ first: row.first, last: row.last, dob: row.dob }),
+          [...(byKey.get(matchKey({ first: row.first, last: row.last, dob: row.dob })) ?? []), created]);
+        stats.created++;
+      }
+      continue;
     }
-    stats.unlinked++;
+    // previously dismissed — stays snapshot-only by explicit human decision
   }
   return stats;
 }
