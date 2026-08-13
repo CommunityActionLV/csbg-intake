@@ -92,7 +92,7 @@ export function HmisPanel({ configured, stats, reviews, programs, programId }: {
     >
       {!configured ? (
         <Empty padding={18}>
-          Not configured yet — add HMIS_TOKEN_URL, HMIS_CLIENT_ID, HMIS_CLIENT_SECRET, and HMIS_BASE_URL to .env.local (never commit them), restart the server, then Test connection.
+          Not configured yet — set the connection in Settings → Integrations (applies immediately), or via HMIS_* environment variables.
         </Empty>
       ) : (
         <>

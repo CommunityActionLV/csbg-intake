@@ -10,18 +10,18 @@ import { audit } from "@/lib/access";
 import { kvGet, kvSet, nextClientId } from "@/lib/data/core";
 import { fmt, shortDate, todayIso } from "@/lib/format";
 import {
-  createClientFromHmis, fetchHmisClients, hmisConfig, hmisToken, runHmisMatching,
+  createClientFromHmis, fetchHmisClients, getHmisConfig, hmisToken, runHmisMatching,
 } from "@/lib/hmis";
 
 export interface HmisActionResult { ok: boolean; message: string }
 
 const NOT_CONFIGURED =
-  "HMIS isn't configured — add HMIS_TOKEN_URL, HMIS_CLIENT_ID, HMIS_CLIENT_SECRET, and HMIS_BASE_URL to .env.local and restart the server.";
+  "HMIS isn't configured — set the connection in Settings → Integrations (or via HMIS_* environment variables).";
 
 /** Verify credentials reach the token endpoint. No data is pulled. */
 export async function testHmisConnection(): Promise<HmisActionResult> {
   const user = await requireAdmin();
-  const cfg = hmisConfig();
+  const { cfg } = await getHmisConfig();
   if (!cfg) return { ok: false, message: NOT_CONFIGURED };
   try {
     await hmisToken(cfg);
@@ -48,7 +48,7 @@ export async function setHmisProgram(programId: string): Promise<HmisActionResul
     unmatched people as client records (internal tracking & reporting). */
 export async function runHmisSync(): Promise<HmisActionResult> {
   const user = await requireAdmin();
-  const cfg = hmisConfig();
+  const { cfg } = await getHmisConfig();
   if (!cfg) return { ok: false, message: NOT_CONFIGURED };
 
   let rows;

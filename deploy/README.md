@@ -40,11 +40,12 @@ Suited to a single office machine or an offline trial. The `data/` directory
 holds both the database and uploaded documents — back that folder up. Not for
 multi-process deployments (one Node server only).
 
-## 3. systemd + PostgreSQL + reverse proxy (IT-managed)
+## 3. systemd + reverse proxy (IT-managed)
 
-A worked example — the original Community Action Lehigh Valley staging setup
-(Apache vhost, systemd unit, provisioning script) — lives in
-`deploy/examples/calv-staging/`. Adapt the hostnames, users, and paths; the
-only contract the app needs is `DATABASE_URL` in the environment and a proxy
-passing HTTP to port 3100. Put TLS in front of it; `CSBG_ALLOW_HTTP=1` exists
-for isolated LAN staging only.
+**Apache on Ubuntu** is the documented generic path: `deploy/apache/` has the
+vhost, the systemd unit, and a step-by-step README (embedded database or
+PostgreSQL — your choice). A messier worked example — the original Community
+Action Lehigh Valley staging setup with its provisioning script — lives in
+`deploy/examples/calv-staging/`. Either way the only contract the app needs
+is `DATABASE_URL` and a proxy passing HTTP to port 3100. Put TLS in front of
+it; `CSBG_ALLOW_HTTP=1` exists for isolated LAN setups only.
