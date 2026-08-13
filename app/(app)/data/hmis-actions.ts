@@ -10,7 +10,7 @@ import { audit } from "@/lib/access";
 import { kvGet, kvSet, nextClientId } from "@/lib/data/core";
 import { fmt, shortDate, todayIso } from "@/lib/format";
 import {
-  createClientFromHmis, fetchHmisClients, getHmisConfig, hmisToken, runHmisMatching,
+  createClientFromHmis, fetchHmisClients, getHmisConfig, hmisAuthTest, runHmisMatching,
 } from "@/lib/hmis";
 
 export interface HmisActionResult { ok: boolean; message: string }
@@ -18,18 +18,16 @@ export interface HmisActionResult { ok: boolean; message: string }
 const NOT_CONFIGURED =
   "HMIS isn't configured — set the connection in Settings → Integrations (or via HMIS_* environment variables).";
 
-/** Verify credentials reach the token endpoint. No data is pulled. */
+/** GET /auth/test — the credentials handshake. No client data is pulled. */
 export async function testHmisConnection(): Promise<HmisActionResult> {
   const user = await requireAdmin();
   const { cfg } = await getHmisConfig();
   if (!cfg) return { ok: false, message: NOT_CONFIGURED };
-  try {
-    await hmisToken(cfg);
-  } catch (e) {
-    return { ok: false, message: `Could not authenticate with PA HMIS: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  await audit(user.id, "hmis.test", "integration", "hmis", "Token endpoint reachable, credentials accepted");
-  return { ok: true, message: "Connected — PA HMIS accepted the credentials." };
+  const res = await hmisAuthTest(cfg);
+  if (!res.ok) return { ok: false, message: res.message };
+  await audit(user.id, "hmis.test", "integration", "hmis",
+    `Credentials accepted${res.environment ? ` — ${res.environment} ClientTrack environment` : ""}`);
+  return { ok: true, message: res.message };
 }
 
 /** Set the program HMIS-imported clients enroll into. */
@@ -51,15 +49,15 @@ export async function runHmisSync(): Promise<HmisActionResult> {
   const { cfg } = await getHmisConfig();
   if (!cfg) return { ok: false, message: NOT_CONFIGURED };
 
-  let rows;
+  let pull;
   try {
-    const token = await hmisToken(cfg);
-    rows = await fetchHmisClients(cfg, token);
+    pull = await fetchHmisClients(cfg);
   } catch (e) {
     return { ok: false, message: `Sync failed while pulling from PA HMIS: ${e instanceof Error ? e.message : String(e)}` };
   }
+  const rows = pull.rows;
   if (rows.length === 0) {
-    return { ok: false, message: "PA HMIS answered but returned no client records — check HMIS_CLIENTS_PATH against the API docs." };
+    return { ok: false, message: "PA HMIS answered but returned no client records — verify the CRQL column names in CRQL_CLIENT_FIELDS against the API docs." };
   }
 
   // full-snapshot semantics: replace the table with this pull
@@ -89,7 +87,13 @@ export async function runHmisSync(): Promise<HmisActionResult> {
   ];
   if (stats.noProgram > 0) parts.push(`${fmt(stats.noProgram)} skipped — set the enrollment program`);
   if (stats.noDob > 0) parts.push(`${fmt(stats.noDob)} kept snapshot-only (no DOB)`);
-  return { ok: true, message: `Synced ${fmt(rows.length)} HMIS records — ${parts.join(", ")}.` };
+  // A pull that stopped after exactly one full page can't be told apart from a
+  // result set that CRQL's mandatory TOP bounded before paging applied, so say
+  // so rather than presenting it as a complete snapshot.
+  const caveat = pull.singlePageCapped
+    ? ` This pull filled exactly one page (${fmt(rows.length)} records) and the next page was empty — confirm with PA HMIS that paging works inside SELECT TOP before treating it as the full statewide snapshot.`
+    : "";
+  return { ok: true, message: `Synced ${fmt(rows.length)} HMIS records — ${parts.join(", ")}.${caveat}` };
 }
 
 /** Resolve a held HMIS near-match: link to a candidate, import as a new

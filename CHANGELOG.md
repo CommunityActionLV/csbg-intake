@@ -6,13 +6,36 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
 
 ## Unreleased — 0.5.0 (roadmap Phases 1–5)
 
+### PA HMIS rebuilt for CTAPI (replaces the OAuth2 assumption)
+- **[compliance]** The PA HMIS transport is Eccovia's ClientTrack API (CTAPI),
+  which has **no OAuth2, no token endpoint, and no client-list endpoint**. The
+  first cut of the connection panel assumed all three and could not produce a
+  working connection; it is replaced outright rather than kept behind a mode
+  selector. Auth is now the two static headers CTAPI requires
+  (`Ocp-Apim-Subscription-Key` and `Authorization: ApiKey …`) plus the optional
+  `OrgId` scope, HTTPS only, verified against PA_HMIS production.
+- Client listing moves to **CRQL** (`GET /crql`): mandatory `SELECT TOP n` bound
+  to the page size (without it a statewide select runs past 30 s), `pageNo` /
+  `pageSize` capped at CTAPI's 500, `shouldCache=true` so multi-page pulls can't
+  shear, a bare `{}` handled as an empty page, `recordCount` ignored because it
+  disagrees with reality, and `ClientID` 0 skipped as a system row.
+- **Test connection** now calls `GET /auth/test` and reports the environment
+  name CTAPI returns, so staff can see whether they reached production. A 401
+  reads as "credentials rejected" and is never retried; 500/502/503/504 retry
+  with backoff inside a bounded attempt count and a request timeout.
+- Stored credentials are **encrypted at rest** (AES-256-GCM, `src/lib/secrets.ts`)
+  with the key held outside the database — `CSBG_SECRET_KEY` or a generated
+  `data/secret.key` (0600) — so a database dump or backup carries no usable
+  credential. Any settings saved under the old OAuth2 shape are dropped on
+  upgrade; the CTAPI keys have to be entered once.
+
 ### Settings → Integrations + Apache/Ubuntu tier
-- New admin **Settings → Integrations** tab: configure the PA HMIS
-  connection (token URL, client ID/secret, base URL, clients path, scope,
-  page size) in the interface — saved to the database, applied immediately,
-  no shell access or restart needed. The secret is write-only (never sent
-  back to the browser, never audited); `HMIS_*` environment variables remain
-  as a fallback, and saved settings take precedence.
+- New admin **Settings → Integrations** tab: configure the PA HMIS connection
+  (base URL, subscription key, API key, Org ID, page size) in the interface —
+  saved to the database, applied immediately, no shell access or restart needed.
+  Both keys are write-only (never sent back to the browser, never audited);
+  `HMIS_*` environment variables remain as a fallback, and saved settings take
+  precedence.
 - New **`deploy/apache/`** tier: Apache reverse-proxy vhost (TLS via
   certbot), hardened systemd unit, and a step-by-step Ubuntu README
   (embedded database or PostgreSQL) — for agencies hosting on an existing

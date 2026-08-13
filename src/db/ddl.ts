@@ -315,4 +315,9 @@ CREATE TABLE IF NOT EXISTS hmis_reviews (
   resolution TEXT, resolved_client_id TEXT, resolved_by TEXT, resolved_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_hmis_reviews_status ON hmis_reviews (status);
+-- The HMIS connection panel was built for an OAuth2 flow the ClientTrack API
+-- (CTAPI) does not have: it authenticates with two static header keys instead.
+-- Any settings saved under the old shape are unusable and cannot be mapped
+-- across, so the row is dropped and staff re-enter the CTAPI keys.
+DELETE FROM kv WHERE key = 'hmisConn' AND value ? 'tokenUrl';
 `;

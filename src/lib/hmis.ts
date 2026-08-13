@@ -3,6 +3,7 @@ import { db, t } from "@/db";
 import { classifyMatches, matchKey } from "@/lib/matching";
 import { canonicalCharacteristic } from "@/lib/csbg-catalog";
 import { getActiveFpl } from "@/lib/fpl";
+import { decryptSecret } from "@/lib/secrets";
 
 /* ID allocation lives in @/lib/data/core, which imports Next's `server-only`
    and therefore can't be imported from this (unit-testable) module — the
@@ -28,58 +29,72 @@ export type ClientIdAllocator = () => Promise<string>;
                              HMIS program (needs a DOB; else snapshot-only)
    Local data always wins: enrichment fills ONLY empty fields.
 
-   Credentials/endpoints come from the environment (.env.local on the
-   local tier — the data folder and machine are password-protected per
-   the MOU's security condition; never commit them):
-     HMIS_TOKEN_URL      OAuth2 token endpoint (client-credentials)
-     HMIS_CLIENT_ID      issued credential
-     HMIS_CLIENT_SECRET  issued credential
-     HMIS_BASE_URL       API root for our instance
-     HMIS_CLIENTS_PATH   client-list path (default /api/clients)
-     HMIS_SCOPE          optional OAuth2 scope
-     HMIS_PAGE_SIZE      page size (default 200)
-   The exact endpoint/paging/field names are the one part of this
-   integration that varies per Eccovia instance — normalizeHmisClient()
-   accepts the common spellings and everything else is env-tunable.
+   The transport is Eccovia's ClientTrack API (CTAPI): no OAuth2 and
+   no token endpoint — two static headers on every request, and client
+   listing through CRQL rather than a REST collection. Verified against
+   PA_HMIS production on 2026-08-13; see
+   docs/compliance/hmis-api-integration-profile.md.
+
+   Configured in Settings → Integrations (encrypted in the database)
+   or, for ops-managed installs, from the environment:
+     HMIS_BASE_URL          API root (default https://api.clienttrack.net)
+     HMIS_SUBSCRIPTION_KEY  Ocp-Apim-Subscription-Key
+     HMIS_API_KEY           Authorization: ApiKey <key>
+     HMIS_ORG_ID            optional — User Keys only
+     HMIS_PAGE_SIZE         CRQL page size (default 200, max 500)
+   Read-only: nothing here writes to HMIS.
    ============================================================ */
 
 export interface HmisConfig {
-  tokenUrl: string;
-  clientId: string;
-  clientSecret: string;
-  baseUrl: string;
-  clientsPath: string;
-  scope: string;
+  baseUrl: string;          // https only — CTAPI rejects plain HTTP
+  subscriptionKey: string;
+  apiKey: string;
+  orgId: string;            // "" → the OrgId header is omitted entirely
   pageSize: number;
 }
 
+/** Prod is the only environment the Eccovia docs expose. The PA_HMIS
+    application name from the ClientTrack login URL is not part of the API URL. */
+export const CTAPI_BASE_URL = "https://api.clienttrack.net";
+/** CTAPI's hard ceiling on pageSize; larger values are not honoured. */
+export const CTAPI_MAX_PAGE_SIZE = 500;
+const DEFAULT_PAGE_SIZE = 200;
+
+/** Records per CRQL page: 1..500, defaulting when the value isn't a number.
+    Enforced here rather than at the input so a hand-edited config can't ask
+    CTAPI for a page it will silently refuse to fill. */
+export function effectivePageSize(value: unknown): number {
+  // absent or blank is "unset", not zero: Number("") is 0, and clamping that to
+  // 1 would turn a cleared form field into a one-record-per-page pull
+  if (value === null || value === undefined || String(value).trim() === "") return DEFAULT_PAGE_SIZE;
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return DEFAULT_PAGE_SIZE;
+  return Math.min(Math.max(n, 1), CTAPI_MAX_PAGE_SIZE);
+}
+
 export function hmisConfig(): HmisConfig | null {
-  const tokenUrl = process.env.HMIS_TOKEN_URL ?? "";
-  const clientId = process.env.HMIS_CLIENT_ID ?? "";
-  const clientSecret = process.env.HMIS_CLIENT_SECRET ?? "";
-  const baseUrl = (process.env.HMIS_BASE_URL ?? "").replace(/\/+$/, "");
-  if (!tokenUrl || !clientId || !clientSecret || !baseUrl) return null;
+  const subscriptionKey = process.env.HMIS_SUBSCRIPTION_KEY ?? "";
+  const apiKey = process.env.HMIS_API_KEY ?? "";
+  const baseUrl = (process.env.HMIS_BASE_URL || CTAPI_BASE_URL).replace(/\/+$/, "");
+  if (!subscriptionKey || !apiKey || !baseUrl) return null;
   return {
-    tokenUrl,
-    clientId,
-    clientSecret,
     baseUrl,
-    clientsPath: process.env.HMIS_CLIENTS_PATH ?? "/api/clients",
-    scope: process.env.HMIS_SCOPE ?? "",
-    pageSize: Math.max(1, Number(process.env.HMIS_PAGE_SIZE) || 200),
+    subscriptionKey,
+    apiKey,
+    orgId: process.env.HMIS_ORG_ID ?? "",
+    pageSize: effectivePageSize(process.env.HMIS_PAGE_SIZE),
   };
 }
 
 /** Connection settings saved from Settings → Integrations (kv "hmisConn").
-    The secret is stored in the database alongside the rest of the agency's
-    protected data — access is admin-gated and it is never rendered back. */
+    Both keys hold ciphertext from @/lib/secrets — the encryption key lives
+    outside the database, so a dump of this table yields no usable credential.
+    Neither value is ever rendered back to the browser. */
 export interface HmisStoredConfig {
-  tokenUrl: string;
-  clientId: string;
-  clientSecret: string;
   baseUrl: string;
-  clientsPath: string;
-  scope: string;
+  subscriptionKey: string;  // ciphertext
+  apiKey: string;           // ciphertext
+  orgId: string;
   pageSize: number;
 }
 
@@ -94,19 +109,23 @@ async function kvRead<T>(key: string): Promise<T | null> {
     otherwise the HMIS_* environment variables. */
 export async function getHmisConfig(): Promise<{ cfg: HmisConfig | null; source: "settings" | "environment" | null }> {
   const stored = await kvRead<Partial<HmisStoredConfig>>("hmisConn");
-  if (stored?.tokenUrl && stored.clientId && stored.clientSecret && stored.baseUrl) {
-    return {
-      source: "settings",
-      cfg: {
-        tokenUrl: stored.tokenUrl,
-        clientId: stored.clientId,
-        clientSecret: stored.clientSecret,
-        baseUrl: stored.baseUrl.replace(/\/+$/, ""),
-        clientsPath: stored.clientsPath || "/api/clients",
-        scope: stored.scope || "",
-        pageSize: Math.max(1, Number(stored.pageSize) || 200),
-      },
-    };
+  if (stored?.subscriptionKey && stored.apiKey && stored.baseUrl) {
+    const subscriptionKey = decryptSecret(stored.subscriptionKey);
+    const apiKey = decryptSecret(stored.apiKey);
+    // Both readable, or fall through to the environment: half-decrypted
+    // credentials would send an empty header and read as a rejection.
+    if (subscriptionKey && apiKey) {
+      return {
+        source: "settings",
+        cfg: {
+          baseUrl: stored.baseUrl.replace(/\/+$/, ""),
+          subscriptionKey,
+          apiKey,
+          orgId: stored.orgId ?? "",
+          pageSize: effectivePageSize(stored.pageSize),
+        },
+      };
+    }
   }
   const env = hmisConfig();
   return { cfg: env, source: env ? "environment" : null };
@@ -116,24 +135,158 @@ export async function hmisConfigured(): Promise<boolean> {
   return (await getHmisConfig()).cfg !== null;
 }
 
-/** OAuth2 client-credentials token. */
-export async function hmisToken(cfg: HmisConfig): Promise<string> {
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: cfg.clientId,
-    client_secret: cfg.clientSecret,
-  });
-  if (cfg.scope) body.set("scope", cfg.scope);
-  const res = await fetch(cfg.tokenUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`token endpoint answered ${res.status}`);
-  const json = (await res.json()) as { access_token?: string };
-  if (!json.access_token) throw new Error("token endpoint returned no access_token");
-  return json.access_token;
+/** True when settings hold keys that this server's encryption key cannot read
+    (a lost or rotated data/secret.key) — the settings page says so instead of
+    showing a connection that cannot work. */
+export async function hmisKeysUnreadable(): Promise<boolean> {
+  const stored = await kvRead<Partial<HmisStoredConfig>>("hmisConn");
+  if (!stored?.subscriptionKey || !stored.apiKey) return false;
+  return decryptSecret(stored.subscriptionKey) === null || decryptSecret(stored.apiKey) === null;
+}
+
+/* ---------- CTAPI transport ---------- */
+
+/** 401 — the credentials themselves were refused. Never retried: replaying a
+    rejected key only burns the rate limit. */
+export class HmisAuthError extends Error {
+  constructor(message = "CTAPI rejected the credentials (401).") {
+    super(message);
+    this.name = "HmisAuthError";
+  }
+}
+
+/** Any other non-2xx answer, carrying the status and a truncated body. */
+export class HmisHttpError extends Error {
+  readonly status: number;
+  readonly body: string;
+  constructor(status: number, body: string) {
+    super(`CTAPI answered ${status}${body ? ` — ${body}` : ""}`);
+    this.name = "HmisHttpError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/** Transient: CTAPI down or wobbling. Retried with backoff. */
+const RETRYABLE_STATUS = new Set([500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const TIMEOUT_MS = 20_000;
+const RETRY_DELAY_MS = 800;
+const BODY_LIMIT = 300;
+
+export interface HmisRequestOptions {
+  /** Injected by tests; defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+  /** Backoff base in ms (tests pass 0 to keep the suite quick). */
+  retryDelayMs?: number;
+}
+
+const truncate = (s: string, n = BODY_LIMIT): string => (s.length <= n ? s : `${s.slice(0, n)}…`);
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The two static headers CTAPI requires on every request, plus the optional
+    organization scope. The literal `ApiKey ` prefix lives here and nowhere
+    else — it is not a bearer token and CTAPI rejects `Bearer`. */
+function ctapiHeaders(cfg: HmisConfig): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Ocp-Apim-Subscription-Key": cfg.subscriptionKey,
+    Authorization: `ApiKey ${cfg.apiKey}`,
+    Accept: "application/json",
+  };
+  const orgId = cfg.orgId?.trim() ?? "";
+  if (orgId) headers.OrgId = orgId;  // User Keys only; Admin Keys ignore it
+  return headers;
+}
+
+/** One GET against CTAPI: HTTPS only, both auth headers, a request timeout, and
+    a bounded retry for transient statuses and network faults. 401 and every
+    other 4xx fail on the first answer. Keys travel as headers only, so no key
+    value can reach a URL, a message, or a thrown error. */
+async function ctapiGet(
+  cfg: HmisConfig,
+  path: string,
+  params: Record<string, string>,
+  opts: HmisRequestOptions = {},
+): Promise<unknown> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const backoff = opts.retryDelayMs ?? RETRY_DELAY_MS;
+  const url = new URL(cfg.baseUrl + path);
+  if (url.protocol !== "https:") {
+    throw new Error("The HMIS API base URL must use https:// — CTAPI rejects plain HTTP.");
+  }
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let res: Response;
+    try {
+      res = await doFetch(url, {
+        headers: ctapiHeaders(cfg),
+        cache: "no-store",
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt === MAX_ATTEMPTS) break;
+      await sleep(backoff * attempt);
+      continue;
+    }
+    if (res.status === 401) throw new HmisAuthError();
+    if (!res.ok) {
+      const body = truncate((await res.text().catch(() => "")).trim());
+      const err = new HmisHttpError(res.status, body);
+      if (!RETRYABLE_STATUS.has(res.status) || attempt === MAX_ATTEMPTS) throw err;
+      lastError = err;
+      await sleep(backoff * attempt);
+      continue;
+    }
+    return (await res.json()) as unknown;
+  }
+  throw lastError ?? new Error("CTAPI request failed.");
+}
+
+/** "Hello CER from from the PA_HMIS ClientTrack environment." → "PA_HMIS".
+    Anchored on the words before "ClientTrack environment", which reads both the
+    documented greeting and the live one (which repeats "from"). */
+export function hmisEnvironmentName(message: string): string | null {
+  return message.match(/([\w.-]+)\s+ClientTrack\s+environment/i)?.[1] ?? null;
+}
+
+export interface HmisAuthTestResult {
+  ok: boolean;
+  /** Environment CTAPI says we reached ("PA_HMIS"), when it says so. */
+  environment: string | null;
+  message: string;
+}
+
+/** GET /auth/test — the only handshake CTAPI has. Reports the environment on
+    success so staff can see whether they reached Prod or a sandbox. */
+export async function hmisAuthTest(cfg: HmisConfig, opts: HmisRequestOptions = {}): Promise<HmisAuthTestResult> {
+  try {
+    const json = await ctapiGet(cfg, "/auth/test", {}, opts);
+    const greeting = typeof (json as Raw)?.message === "string" ? String((json as Raw).message) : "";
+    const environment = hmisEnvironmentName(greeting);
+    return {
+      ok: true,
+      environment,
+      message: environment
+        ? `Connected — PA HMIS accepted the credentials on the ${environment} ClientTrack environment.`
+        : `Connected — PA HMIS accepted the credentials. ${truncate(greeting || "CTAPI returned no environment name.", 160)}`,
+    };
+  } catch (e) {
+    if (e instanceof HmisAuthError) {
+      return {
+        ok: false,
+        environment: null,
+        message: "Credentials rejected — check the subscription key and API key, and note that the two are easy to transpose.",
+      };
+    }
+    if (e instanceof HmisHttpError) {
+      return { ok: false, environment: null, message: `PA HMIS answered ${e.status}${e.body ? ` — ${e.body}` : ""}` };
+    }
+    return { ok: false, environment: null, message: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /* ---------- normalization ---------- */
@@ -217,32 +370,95 @@ export function normalizeHmisClient(raw: Raw): HmisClientRow | null {
   };
 }
 
-/** Pull every client page from the API. Handles the two common Eccovia
-    response shapes: a bare array, or { data: [...] } / { value: [...] }. */
-export async function fetchHmisClients(cfg: HmisConfig, token: string): Promise<HmisClientRow[]> {
+/* ---------- CRQL client listing ---------- */
+
+/** Columns read from cmClient. ClientID / FirstName / LastName / ActiveStatus
+    are verified against PA_HMIS production; the rest carry the spellings the
+    MOU elements are expected to use and are UNVERIFIED — a wrong name makes
+    CRQL answer 400 naming the column, and this list is the single place to fix
+    it. CRQL forbids wildcards, so every column is named explicitly. */
+export const CRQL_CLIENT_FIELDS = [
+  "ClientID", "FirstName", "LastName", "ActiveStatus",
+  "DOB", "Email", "Phone", "Gender", "Race", "Ethnicity",
+  "VeteranStatus", "HealthInsuranceType", "SourceOfIncome", "NonCashBenefits",
+];
+
+/** CTAPI caps the query portion of the URL at 2048 chars once encoded. */
+const CRQL_MAX_QUERY_CHARS = 2048;
+
+/** The paged client query.
+
+    `SELECT TOP n` is mandatory in practice, though undocumented: without it a
+    statewide select runs past 30 s and is aborted, and pageSize alone does not
+    bound the work. TOP is emitted from the same effective page size as the
+    pageSize parameter so the two cannot drift apart.
+
+    No ORDER BY — the one live query carrying one timed out. `shouldCache=true`
+    is what holds a multi-page pull together instead. */
+export function crqlClientQuery(pageSize: number): string {
+  return `SELECT TOP ${pageSize} ${CRQL_CLIENT_FIELDS.join(", ")} FROM cmClient`;
+}
+
+/** Rows out of one CRQL response.
+
+    The envelope is `{recordCount, cacheExpirationDate, data:{Table1:[…]}}` when
+    there are matches and a bare `{}` when there are none, so every level is
+    checked before use — `json.data.Table1.length` throws on any no-match query.
+    `recordCount` is deliberately ignored: live responses disagreed with the
+    actual row count, so it cannot drive paging. */
+export function crqlRows(json: unknown): Raw[] {
+  const data = (json as Raw | null | undefined)?.data as Raw | undefined;
+  const table = data?.Table1;
+  return Array.isArray(table) ? (table as Raw[]) : [];
+}
+
+export interface HmisPull {
+  rows: HmisClientRow[];
+  /** Pages requested (not pages with data). */
+  pages: number;
+  /** One full page then an empty one — indistinguishable from a result set that
+      `TOP` bounded before paging applied, so the caller reports the ambiguity
+      rather than claiming a complete snapshot. See the integration profile. */
+  singlePageCapped: boolean;
+}
+
+/** Pull the client list through CRQL, page by page. Rows the API can't identify
+    are dropped, and ClientID 0 — a system/template row, not a person — is
+    skipped. Ends on the first short page. */
+export async function fetchHmisClients(cfg: HmisConfig, opts: HmisRequestOptions = {}): Promise<HmisPull> {
+  const pageSize = effectivePageSize(cfg.pageSize);
+  const q = crqlClientQuery(pageSize);
+  if (encodeURIComponent(q).length > CRQL_MAX_QUERY_CHARS) {
+    throw new Error("The CRQL client query is over CTAPI's 2048-character limit — shorten CRQL_CLIENT_FIELDS.");
+  }
   const out: HmisClientRow[] = [];
   const MAX_PAGES = 200; // safety backstop (MAX_PAGES × pageSize records)
+  let pages = 0;
+  let firstPageRows = 0;
+  let lastPageRows = 0;
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const url = new URL(cfg.baseUrl + cfg.clientsPath);
-    url.searchParams.set("page", String(page));
-    url.searchParams.set("pageSize", String(cfg.pageSize));
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-      cache: "no-store",
-    });
-    if (!res.ok) throw new Error(`${cfg.clientsPath} answered ${res.status} on page ${page}`);
-    const json = (await res.json()) as unknown;
-    const items: Raw[] = Array.isArray(json) ? (json as Raw[])
-      : Array.isArray((json as Raw).data) ? ((json as Raw).data as Raw[])
-      : Array.isArray((json as Raw).value) ? ((json as Raw).value as Raw[])
-      : [];
-    for (const raw of items) {
-      const row = normalizeHmisClient(raw);
-      if (row) out.push(row);
+    const json = await ctapiGet(cfg, "/crql", {
+      q,
+      pageNo: String(page),        // 1-based; OFFSET is rejected by the parser
+      pageSize: String(pageSize),
+      shouldCache: "true",         // server-side snapshot so pages can't shear
+    }, opts);
+    const raw = crqlRows(json);
+    pages = page;
+    lastPageRows = raw.length;
+    if (page === 1) firstPageRows = raw.length;
+    for (const item of raw) {
+      const row = normalizeHmisClient(item);
+      if (!row || row.hmisId === "0") continue;
+      out.push(row);
     }
-    if (items.length < cfg.pageSize) break; // short page = last page
+    if (raw.length < pageSize) break; // short page = last page
   }
-  return out;
+  return {
+    rows: out,
+    pages,
+    singlePageCapped: pages === 2 && firstPageRows === pageSize && lastPageRows === 0,
+  };
 }
 
 /* ---------- integration pass: dedup, enrich, import ---------- */

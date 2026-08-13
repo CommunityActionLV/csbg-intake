@@ -1,7 +1,7 @@
 "use client";
-/* Settings → Integrations — PA HMIS connection form. The secret field is
-   write-only: it never round-trips to the browser; leaving it blank keeps
-   whatever is stored. */
+/* Settings → Integrations — PA HMIS (ClientTrack API) connection form. Both key
+   fields are write-only: they never round-trip to the browser, and leaving one
+   blank keeps whatever is stored. */
 import { useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -12,15 +12,14 @@ import { testHmisConnection } from "../../data/hmis-actions";
 import { clearHmisSettings, saveHmisSettings } from "./actions";
 
 export interface HmisSettingsView {
-  tokenUrl: string;
-  clientId: string;
-  hasSecret: boolean;      // a secret is stored (its value never leaves the server)
   baseUrl: string;
-  clientsPath: string;
-  scope: string;
+  hasSubscriptionKey: boolean;   // a key is stored (its value never leaves the server)
+  hasApiKey: boolean;
+  orgId: string;
   pageSize: number;
   source: "settings" | "environment" | null;
-  envConfigured: boolean;  // HMIS_* environment variables would apply if cleared
+  envConfigured: boolean;        // HMIS_* environment variables would apply if cleared
+  keysUnreadable: boolean;       // stored keys can't be decrypted on this server
 }
 
 export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
@@ -28,12 +27,10 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [form, setForm] = useState({
-    tokenUrl: initial.tokenUrl,
-    clientId: initial.clientId,
-    clientSecret: "",
     baseUrl: initial.baseUrl,
-    clientsPath: initial.clientsPath,
-    scope: initial.scope,
+    subscriptionKey: "",
+    apiKey: "",
+    orgId: initial.orgId,
     pageSize: String(initial.pageSize || 200),
   });
   const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -44,7 +41,7 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
       const res = await saveHmisSettings(form);
       toast(res.message);
       if (res.ok) {
-        setForm((f) => ({ ...f, clientSecret: "" }));
+        setForm((f) => ({ ...f, subscriptionKey: "", apiKey: "" }));
         router.refresh();
       }
     });
@@ -63,13 +60,17 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
     });
   }
 
-  const canSave = form.tokenUrl.trim() !== "" && form.clientId.trim() !== "" && form.baseUrl.trim() !== ""
-    && (form.clientSecret.trim() !== "" || initial.hasSecret);
+  const canSave = form.baseUrl.trim() !== ""
+    && (form.subscriptionKey.trim() !== "" || initial.hasSubscriptionKey)
+    && (form.apiKey.trim() !== "" || initial.hasApiKey);
+
+  const keyHint = (stored: boolean, issued: string) =>
+    stored ? "Stored — leave blank to keep it, or paste a new one to replace it." : issued;
 
   return (
     <Panel
       title="PA HMIS connection"
-      sub="Credentials issued under the PA DCED MOU. Saved settings apply immediately — no server restart. Sync runs from Data & integrations."
+      sub="ClientTrack API credentials issued under the PA DCED MOU. Saved settings apply immediately — no server restart. Sync runs from Data & integrations."
       right={
         initial.source ? (
           <Chip tone={initial.source === "settings" ? "sage" : "teal"}>
@@ -82,32 +83,28 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 14, maxWidth: 720 }}>
         <div className="fgrid c2">
-          <Field label="OAuth2 token URL" required hint="From the Eccovia API documentation for your instance.">
-            <input value={form.tokenUrl} onChange={set("tokenUrl")} placeholder="https://…/oauth/token" />
+          <Field label="API base URL" required hint="Production is the only environment Eccovia exposes.">
+            <input value={form.baseUrl} onChange={set("baseUrl")} placeholder="https://api.clienttrack.net" />
           </Field>
-          <Field label="API base URL" required hint="Root the client-list path is appended to.">
-            <input value={form.baseUrl} onChange={set("baseUrl")} placeholder="https://…" />
+          <Field label="Org ID" hint="User Keys only — scopes results to one organization.">
+            <input value={form.orgId} onChange={set("orgId")} autoComplete="off" />
           </Field>
         </div>
         <div className="fgrid c2">
-          <Field label="Client ID" required>
-            <input value={form.clientId} onChange={set("clientId")} autoComplete="off" />
+          <Field label="Subscription key" required={!initial.hasSubscriptionKey}
+            hint={keyHint(initial.hasSubscriptionKey, "Sent as Ocp-Apim-Subscription-Key.")}>
+            <input type="password" value={form.subscriptionKey} onChange={set("subscriptionKey")}
+              placeholder={initial.hasSubscriptionKey ? "•••••••• (unchanged)" : ""} autoComplete="new-password" />
           </Field>
-          <Field label="Client secret" required={!initial.hasSecret}
-            hint={initial.hasSecret ? "A secret is stored — leave blank to keep it, or paste a new one to replace it." : "Issued with the client ID."}>
-            <input type="password" value={form.clientSecret} onChange={set("clientSecret")}
-              placeholder={initial.hasSecret ? "•••••••• (unchanged)" : ""} autoComplete="new-password" />
+          <Field label="API key" required={!initial.hasApiKey}
+            hint={keyHint(initial.hasApiKey, "Sent as Authorization: ApiKey …")}>
+            <input type="password" value={form.apiKey} onChange={set("apiKey")}
+              placeholder={initial.hasApiKey ? "•••••••• (unchanged)" : ""} autoComplete="new-password" />
           </Field>
         </div>
-        <div className="fgrid c3">
-          <Field label="Clients path" hint="Defaults to /api/clients — match your instance's stored procedure/endpoint.">
-            <input value={form.clientsPath} onChange={set("clientsPath")} placeholder="/api/clients" />
-          </Field>
-          <Field label="OAuth2 scope" hint="Only if the API docs require one.">
-            <input value={form.scope} onChange={set("scope")} />
-          </Field>
-          <Field label="Page size" hint="Records per request (default 200).">
-            <input type="number" min={1} max={1000} value={form.pageSize} onChange={set("pageSize")} />
+        <div className="fgrid c2">
+          <Field label="Page size" hint="Records per CRQL page (default 200, CTAPI's maximum is 500).">
+            <input type="number" min={1} max={500} value={form.pageSize} onChange={set("pageSize")} />
           </Field>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -118,7 +115,7 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
           <button className="calv-btn calv-btn--secondary calv-btn--sm" disabled={pending || !initial.source} onClick={onTest}>
             Test connection
           </button>
-          {initial.hasSecret || initial.tokenUrl ? (
+          {initial.hasSubscriptionKey || initial.hasApiKey ? (
             <button className="calv-btn calv-btn--quiet calv-btn--sm" disabled={pending} onClick={onClear}>
               Clear saved settings
             </button>
@@ -127,6 +124,12 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
             Sync itself runs from <Link className="tlink" href="/data">Data &amp; integrations</Link>.
           </span>
         </div>
+        {initial.keysUnreadable ? (
+          <Notice tone="warn" icon="alert">
+            The stored keys can&apos;t be decrypted on this server — the encryption key (data/secret.key,
+            or CSBG_SECRET_KEY) has changed or is missing. Paste both keys again to re-save them.
+          </Notice>
+        ) : null}
         {initial.envConfigured ? (
           <Notice tone="sand">
             HMIS_* environment variables are also set on this server. Saved settings take precedence; Clear saved settings falls back to the environment values.
