@@ -79,7 +79,18 @@ snapshot exists: Trellis total, HMIS total (CACLV projects), matched overlap
 (counted once), HMIS-only, and the unduplicated org-wide total. Counts only —
 no identifying fields leave `src/lib/hmis.ts#hmisAggregate`.
 
-## Configuration (environment, never committed)
+## Configuration
+
+Primary: **Settings → Integrations** (admin-only) — token URL, client
+ID/secret, base URL, clients path, scope, page size. Saved to the database
+and applied immediately, no restart; suits hosted tiers (Apache/Ubuntu,
+Docker) where staff have no shell access. The secret is write-only in the
+UI and never appears in the audit log.
+
+Fallback: `HMIS_*` environment variables (same names below) — used when
+nothing is saved in Settings; useful for ops-managed installs. Saved
+settings take precedence; "Clear saved settings" falls back to the
+environment.
 
 ```
 HMIS_TOKEN_URL=      # OAuth2 token endpoint (client-credentials grant)
@@ -91,10 +102,11 @@ HMIS_SCOPE=          # optional
 HMIS_PAGE_SIZE=      # optional, default 200
 ```
 
-On the local Windows tier these live in `.env.local`; the machine and data
-folder are access-restricted, satisfying the MOU's secure-storage condition.
-Data & Integrations → PA HMIS sync has **Test connection** (token round-trip
-only) and **Run sync** (full snapshot pull + matching pass). Admin-only.
+Credentials rest inside the app database (or the server's `.env.local`),
+on access-restricted machines — satisfying the MOU's secure-storage
+condition. Data & Integrations → PA HMIS sync has **Test connection**
+(token round-trip only) and **Run sync** (full snapshot pull + integration
+pass). Admin-only.
 
 ## Sync design (as built)
 

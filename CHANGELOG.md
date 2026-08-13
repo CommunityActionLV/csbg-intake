@@ -6,6 +6,18 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
 
 ## Unreleased — 0.5.0 (roadmap Phases 1–5)
 
+### Settings → Integrations + Apache/Ubuntu tier
+- New admin **Settings → Integrations** tab: configure the PA HMIS
+  connection (token URL, client ID/secret, base URL, clients path, scope,
+  page size) in the interface — saved to the database, applied immediately,
+  no shell access or restart needed. The secret is write-only (never sent
+  back to the browser, never audited); `HMIS_*` environment variables remain
+  as a fallback, and saved settings take precedence.
+- New **`deploy/apache/`** tier: Apache reverse-proxy vhost (TLS via
+  certbot), hardened systemd unit, and a step-by-step Ubuntu README
+  (embedded database or PostgreSQL) — for agencies hosting on an existing
+  Apache VM.
+
 ### PA HMIS sync
 - **[compliance]** Live PA HMIS (Eccovia ClientTrack/CaseWorthy) integration
   under the signed PA DCED MOU and the CACLV ↔ PA HMIS operating

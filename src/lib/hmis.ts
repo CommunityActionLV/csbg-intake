@@ -70,7 +70,51 @@ export function hmisConfig(): HmisConfig | null {
   };
 }
 
-export const hmisConfigured = (): boolean => hmisConfig() !== null;
+/** Connection settings saved from Settings → Integrations (kv "hmisConn").
+    The secret is stored in the database alongside the rest of the agency's
+    protected data — access is admin-gated and it is never rendered back. */
+export interface HmisStoredConfig {
+  tokenUrl: string;
+  clientId: string;
+  clientSecret: string;
+  baseUrl: string;
+  clientsPath: string;
+  scope: string;
+  pageSize: number;
+}
+
+async function kvRead<T>(key: string): Promise<T | null> {
+  // direct kv access — @/lib/data/core imports Next's `server-only`, which
+  // this unit-testable module must not pull in
+  const row = (await db.select().from(t.kv).where(eq(t.kv.key, key)))[0];
+  return row ? (row.value as T) : null;
+}
+
+/** Effective connection config: Settings → Integrations when saved there,
+    otherwise the HMIS_* environment variables. */
+export async function getHmisConfig(): Promise<{ cfg: HmisConfig | null; source: "settings" | "environment" | null }> {
+  const stored = await kvRead<Partial<HmisStoredConfig>>("hmisConn");
+  if (stored?.tokenUrl && stored.clientId && stored.clientSecret && stored.baseUrl) {
+    return {
+      source: "settings",
+      cfg: {
+        tokenUrl: stored.tokenUrl,
+        clientId: stored.clientId,
+        clientSecret: stored.clientSecret,
+        baseUrl: stored.baseUrl.replace(/\/+$/, ""),
+        clientsPath: stored.clientsPath || "/api/clients",
+        scope: stored.scope || "",
+        pageSize: Math.max(1, Number(stored.pageSize) || 200),
+      },
+    };
+  }
+  const env = hmisConfig();
+  return { cfg: env, source: env ? "environment" : null };
+}
+
+export async function hmisConfigured(): Promise<boolean> {
+  return (await getHmisConfig()).cfg !== null;
+}
 
 /** OAuth2 client-credentials token. */
 export async function hmisToken(cfg: HmisConfig): Promise<string> {

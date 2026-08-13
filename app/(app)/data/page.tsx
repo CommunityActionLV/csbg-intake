@@ -121,7 +121,7 @@ export default async function DataPage() {
       services={services}
     />
     <HmisPanel
-      configured={hmisConfigured()}
+      configured={await hmisConfigured()}
       stats={hmisStats}
       reviews={hmisReviews}
       programs={programs.map((p) => ({ id: p.id, name: p.name }))}

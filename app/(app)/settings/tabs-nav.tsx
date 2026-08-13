@@ -9,6 +9,7 @@ const TABS = [
   { href: "/settings/users", label: "Users" },
   { href: "/settings/fpl", label: "FPL" },
   { href: "/settings/forms", label: "Forms" },
+  { href: "/settings/integrations", label: "Integrations" },
   { href: "/settings/database", label: "Database" },
 ];
 

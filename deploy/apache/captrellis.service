@@ -1,0 +1,29 @@
+# CAP Trellis — systemd unit (Ubuntu, Apache reverse-proxy tier)
+# Install:
+#   sudo cp deploy/apache/captrellis.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now captrellis
+# Logs: journalctl -u captrellis -f
+[Unit]
+Description=CAP Trellis (Next.js server behind Apache)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+# a dedicated low-privilege user that owns /opt/captrellis
+User=captrellis
+Group=captrellis
+WorkingDirectory=/opt/captrellis
+# .env.local in the WorkingDirectory is read by Next.js automatically;
+# EnvironmentFile is only needed for values you keep outside the app folder
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/captrellis/data /opt/captrellis/.next
+
+[Install]
+WantedBy=multi-user.target
