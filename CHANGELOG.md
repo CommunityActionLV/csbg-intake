@@ -6,6 +6,32 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
 
 ## Unreleased — 0.5.0 (roadmap Phases 1–5)
 
+### PA HMIS sync
+- **[compliance]** Live PA HMIS (Eccovia ClientTrack/CaseWorthy) integration
+  under the signed PA DCED MOU and the CACLV ↔ PA HMIS operating
+  understanding: CACLV-project records flow into this private, internal-only
+  system for internal tracking and reporting. The HMIS-side stored procedure
+  returns pre-deduplicated results; our matching engine additionally
+  deduplicates against the client directory.
+- Sync behavior per HMIS person: already linked → **fill blank fields only**
+  (local data always wins); exact name+DOB → auto-link + blank-fill
+  (audited); near match → review queue (**link / import as new client /
+  dismiss**; dismissals stick); no match → **imported as a client record**
+  into the configured HMIS enrollment program, flagged for income &
+  eligibility verification (HMIS supplies no income figure), FPL year pinned
+  to the active schedule. DOB-less records stay snapshot-only.
+- Admin-only `hmis_clients` snapshot (full-replace per sync), OAuth2
+  client-credentials adapter via `HMIS_*` environment settings, field-name-
+  tolerant normalization, Test connection + Run sync + enrollment-program
+  setting on Data & Integrations.
+- /reports gains "Organization-wide unduplicated · with PA HMIS": Trellis
+  total, HMIS total, matched overlap counted once, unduplicated org-wide
+  total. Counts only, no identifying fields.
+- `docs/compliance/hmis-api-integration-profile.md` rewritten: operating
+  understanding, security conditions, and the electronic-file disposition
+  procedure (plus a note to align the MOU's written wording at next
+  revision).
+
 ### Import templates: accepted-values key
 - Template downloads are now .xlsx workbooks with two sheets: the **Import**
   sheet (headers + the skip-guaranteed example row — the only sheet the

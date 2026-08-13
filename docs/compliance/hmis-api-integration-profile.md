@@ -1,81 +1,129 @@
 # HMIS API Integration Profile
 
-Working profile for the HMIS (CaseWorthy / ClientTrack) → csbg-intake client
-synchronization. This is the reference for vendor/product-specialist questions
-and the build spec once API documentation for our instance arrives.
+Reference for the PA HMIS (Eccovia ClientTrack/CaseWorthy) → CAP Trellis
+integration.
 
-**Status:** MOU signed and delivered to the HMIS Lead (July 2026). Waiting on the
-CaseWorthy/ClientTrack product specialist for API next steps. No credentials
-issued yet; no integration code built yet.
+**Status:** MOU **signed by both parties** (PA DCED 6/29/2026 · CACLV
+7/27/2026, effective 7/1/2026 until terminated). **API credentials issued.**
+Sync engine, snapshot store, matching pass, review queue, and the
+organization-wide unduplicated aggregate are **built**. Remaining: pin the
+exact endpoint paths/paging/field names against the Eccovia API docs
+(<https://apidoc.eccovia.com>) and run the first production sync.
 
-## Purpose & direction
+## Permitted use — the operating understanding
 
-- **One-way, inbound only:** HMIS → csbg-intake. We never write back to HMIS.
-- **Purpose:** synchronize client identity + demographics to eliminate double
-  entry at intake. No case notes, assessments, or service transactions beyond
-  the service elements the MOU names.
+Scope is limited to data entered by and for **CACLV-owned projects**. Per the
+operating understanding between CACLV and PA HMIS (confirmed by the Homeless
+Program Manager with the HMIS engineer who built the API's stored procedure):
+the shared elements are pulled into CAP Trellis — a **private, internal-only
+system** — for CACLV's internal tracking and reporting. That includes
+importing contact information and demographics into client records. The
+MOU's "deduplication" language refers to the HMIS-side stored procedure,
+which returns **pre-deduplicated result sets**; on our side the matching
+engine additionally deduplicates against the existing client directory so
+nobody is double-counted.
 
-## Data elements (per signed MOU)
+Standing obligations either way: the data is never redisclosed, never used
+outside the agency, stored securely with access limited to staff working on
+this (admin-gated), and electronic-file disposition is coordinated with
+PA DCED (procedure below). *Housekeeping note:* the MOU's written
+"exclusively … deidentified aggregate reports" sentence is narrower than
+this operating understanding — worth asking DCED to align the text at the
+next revision so a monitoring review reads the same way both parties do.
 
-| MOU element | csbg-intake destination |
+## Data elements (per signed MOU) → where they land
+
+| MOU element | Destination (all in the `hmis_clients` snapshot) |
 |---|---|
-| First name / Last name | `clients.first` / `clients.last` |
-| Date of birth | `clients.dob` |
-| Email | (tiebreaker signal; storage TBD — no email column today) |
-| Telephone | `clients.phone` |
-| **Client ID** | `client_external_ids` (system = `hmis`) — durable link key |
-| Services | `service_log` (mapping to AR 3.0 codes TBD with vendor docs) |
-| Gender and Sex | `clients.sex` (canonicalized via C1) |
-| Race / Ethnicity | `clients.race` (canonicalized via C6) |
-| Veteran status | `clients.military` |
-| Health insurance type | `clients.insurance` |
-| Source of income | `clients.incomeSrc` |
-| Non-cash benefits | TBD — likely `clients.custom` until modeled |
-| Family members (first/last/DOB) | TBD — household members are not individual records today (`hhSize`/`hhType` only). Decide: ingest as clients vs. validate household size. |
+| First name / Last name | `first` / `last` |
+| Date of birth | `dob` |
+| Email / Telephone | `email` / `phone` — **matching tiebreakers only** |
+| **Client ID** | `hmis_id` (PK) + `client_external_ids` when linked |
+| Services | `services` (jsonb name/date list) |
+| Gender and Sex | `sex` (kept distinct when both provided) |
+| Race / Ethnicity | `race` (combined text) |
+| Veteran status | `veteran` |
+| Health insurance type | `insurance` |
+| Source of income | `income_src` |
+| Non-cash benefits | `non_cash` |
+| Family members (first/last/DOB) | `household` (jsonb list) |
 
 **No SSN in any form.** The MOU excludes it; the system stores none.
 
-## Matching & de-duplication policy
+## Sync behavior (as built)
 
-1. **Linked records (every sync after the first):** exact match on stored HMIS
-   Client ID in `client_external_ids`. Unambiguous; no fuzzy logic.
-2. **First-time linkage:** name + DOB against existing clients
-   (shared engine in `src/lib/matching.ts`).
-   - Exact name+DOB match → link candidate.
-   - Near matches → **held in the match-review queue** (`match_reviews`) for
-     human resolution. Nothing merges silently.
-   - Email / telephone are **tiebreakers only**, never primary keys.
-3. **Human review:** Data & Integrations → review queue. Resolutions: use
-   existing record / create new record / dismiss. Every resolution is audited.
+Per HMIS person, each sync:
 
-## Sync design (to confirm with vendor)
+1. **Already linked** (`client_external_ids`, system `hmis`): fill **blank**
+   fields on the linked record — phone, sex, race, veteran/military,
+   insurance, income source, email (stored in `custom.email`). **Local data
+   always wins**; nothing non-empty is ever overwritten.
+2. **Exact identity** (normalized name + DOB, single candidate): auto-link
+   (audited) + the same blank-fill.
+3. **Near matches** (shared engine, `src/lib/matching.ts`; email/phone are
+   tiebreakers, never keys): held in `hmis_reviews` — resolutions are
+   **link**, **import as new client**, or **dismiss** (keep snapshot-only).
+   Dismissals stick across syncs. Every resolution is audited.
+4. **No match:** imported as a new client record — enrolled into the
+   configured HMIS program (Data page setting), flagged
+   "HMIS import — verify income & eligibility data" (HMIS supplies no income
+   figure, so imports land at $0 income and must be verified before any
+   eligibility determination), `hhSize` derived from the family-members
+   list, FPL year pinned to the active schedule. Requires a DOB
+   (`clients.dob` is NOT NULL) — DOB-less records stay snapshot-only.
 
-- **Method:** scheduled batch pull, nightly. Prefer incremental/delta
-  (records changed since last sync cursor) over full snapshot.
-- **Volume:** full initial backfill, then daily deltas.
-- **Auth:** whatever the platform issues (OAuth2 client-credentials preferred,
-  issued API key acceptable). Credentials encrypted at rest, never in source,
-  rotatable.
-- **Environments:** sandbox first, production after validation.
+## Aggregates (as built)
 
-## Security posture
+/reports shows "Organization-wide unduplicated · with PA HMIS" once a
+snapshot exists: Trellis total, HMIS total (CACLV projects), matched overlap
+(counted once), HMIS-only, and the unduplicated org-wide total. Counts only —
+no identifying fields leave `src/lib/hmis.ts#hmisAggregate`.
 
-- TLS in transit; PostgreSQL encrypted at rest.
-- Integration surface is admin-only (`requireAdmin`) — same gate as the rest
-  of Data & Integrations.
-- All sync runs, imports, and match resolutions write `audit_log` rows.
-- Data used for intake/eligibility only; not redisclosed.
+## Configuration (environment, never committed)
 
-## Open questions for the product specialist
+```
+HMIS_TOKEN_URL=      # OAuth2 token endpoint (client-credentials grant)
+HMIS_CLIENT_ID=
+HMIS_CLIENT_SECRET=
+HMIS_BASE_URL=       # API root for our instance
+HMIS_CLIENTS_PATH=   # optional, default /api/clients
+HMIS_SCOPE=          # optional
+HMIS_PAGE_SIZE=      # optional, default 200
+```
 
-1. Which API (REST/SOAP, version) is provisioned for our instance, and where
-   are the docs?
-2. OAuth2 client-credentials or issued API key?
-3. Delta/incremental query support (modified-since cursor)?
-4. Rate limits / page sizes for the initial backfill?
-5. Sandbox instance availability?
-6. How "Services" are coded on their side (so we can map to AR 3.0 codes)?
-7. Static-IP allowlisting requirements, if any?
+On the local Windows tier these live in `.env.local`; the machine and data
+folder are access-restricted, satisfying the MOU's secure-storage condition.
+Data & Integrations → PA HMIS sync has **Test connection** (token round-trip
+only) and **Run sync** (full snapshot pull + matching pass). Admin-only.
+
+## Sync design (as built)
+
+- **One-way, inbound only.** Full-snapshot semantics: each run replaces
+  `hmis_clients` wholesale, then re-runs the matching pass. Links and review
+  resolutions persist across runs.
+- Field-name-tolerant normalization (`normalizeHmisClient`) accepts
+  PascalCase / camelCase / snake_case spellings; rows without an ID or name
+  are dropped.
+- Response-shape tolerant paging (bare array, `{data:[...]}`, `{value:[...]}`;
+  short page = last page; 200-page backstop).
+- All syncs, links, and dismissals write `audit_log` rows.
+
+## To finalize against the Eccovia docs
+
+1. Exact client-list endpoint path + auth specifics for our instance
+   (set via `HMIS_BASE_URL`/`HMIS_CLIENTS_PATH`/`HMIS_TOKEN_URL`).
+2. Real pagination parameter names (currently `page`/`pageSize`).
+3. Delta/modified-since support (currently full snapshot each run).
+4. How Services and family members are represented in responses.
+5. Rate limits for the initial backfill.
+
+## Disposition of electronic files (MOU condition)
+
+The snapshot lives inside the app database only. To end the arrangement:
+stop the sync (remove the `HMIS_*` env settings) and clear the snapshot
+(`DELETE FROM hmis_clients; DELETE FROM hmis_reviews;`) — coordinate final
+disposition with PA DCED as the MOU requires. Linkage rows in
+`client_external_ids` contain only opaque IDs.
 
 ## Related
 
