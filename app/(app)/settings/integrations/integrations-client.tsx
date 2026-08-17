@@ -17,6 +17,8 @@ export interface HmisSettingsView {
   hasApiKey: boolean;
   orgId: string;
   pageSize: number;
+  storedProcedure: string;       // set = the client source; blank = CRQL query
+  storedProcedureParams: string; // pretty-printed JSON object
   source: "settings" | "environment" | null;
   envConfigured: boolean;        // HMIS_* environment variables would apply if cleared
   keysUnreadable: boolean;       // stored keys can't be decrypted on this server
@@ -26,15 +28,19 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
   const toast = useToast();
   const router = useRouter();
   const [pending, startTransition] = useTransition();
+  const [result, setResult] = useState<{ ok: boolean; lines: string[] } | null>(null);
   const [form, setForm] = useState({
     baseUrl: initial.baseUrl,
     subscriptionKey: "",
     apiKey: "",
     orgId: initial.orgId,
     pageSize: String(initial.pageSize || 200),
+    storedProcedure: initial.storedProcedure,
+    storedProcedureParams: initial.storedProcedureParams || "{}",
   });
-  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
-    setForm((f) => ({ ...f, [k]: e.target.value }));
+  const set = (k: keyof typeof form) =>
+    (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
+      setForm((f) => ({ ...f, [k]: e.target.value }));
 
   function onSave() {
     startTransition(async () => {
@@ -42,6 +48,7 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
       toast(res.message);
       if (res.ok) {
         setForm((f) => ({ ...f, subscriptionKey: "", apiKey: "" }));
+        setResult(null);
         router.refresh();
       }
     });
@@ -49,6 +56,9 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
   function onTest() {
     startTransition(async () => {
       const res = await testHmisConnection();
+      // shown in the panel rather than a toast: the procedure step reports the
+      // column names it found, which is the point of running it
+      setResult({ ok: res.ok, lines: res.lines });
       toast(res.message);
     });
   }
@@ -103,10 +113,37 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
           </Field>
         </div>
         <div className="fgrid c2">
-          <Field label="Page size" hint="Records per CRQL page (default 200, CTAPI's maximum is 500).">
+          <Field label="Page size" hint="Records per CRQL page (default 200, CTAPI's maximum is 500). Applies to CRQL queries only — the stored-procedure endpoint takes no paging parameters.">
             <input type="number" min={1} max={500} value={form.pageSize} onChange={set("pageSize")} />
           </Field>
         </div>
+        <div className="fgrid c2">
+          <Field label="Stored procedure"
+            hint="The schema prefix is optional — C_Report_Example and dbo.C_Report_Example both work, and the name is saved exactly as typed. Leave blank to sync with a CRQL query instead.">
+            <input value={form.storedProcedure} onChange={set("storedProcedure")}
+              placeholder="C_Report_Example_API" autoComplete="off" spellCheck={false} />
+          </Field>
+          <Field label="Stored procedure parameters"
+            hint="JSON object of the procedure's parameters. Leave as {} if it takes none.">
+            <textarea value={form.storedProcedureParams} onChange={set("storedProcedureParams")}
+              rows={3} spellCheck={false} style={{ fontFamily: "var(--calv-mono, monospace)", fontSize: 12.5 }} />
+          </Field>
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--calv-slate-65)" }}>
+          <strong>Client source:</strong>{" "}
+          {initial.storedProcedure
+            ? <>stored procedure <code>{initial.storedProcedure}</code></>
+            : <>CRQL query on <code>cmClient</code></>}
+          {form.storedProcedure.trim() !== initial.storedProcedure
+            ? <> — changes when you save.</>
+            : null}
+        </div>
+        <Notice tone="warn" icon="alert">
+          Whatever is named here is <strong>executed</strong> against PA HMIS production when you
+          sync or test. Eccovia&apos;s stored-procedure endpoint runs write procedures too
+          (their own examples include <code>Merge_Client</code> and <code>Delete_Client</code>),
+          and nothing in the API distinguishes them — only name a read-only report procedure.
+        </Notice>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <button className="calv-btn calv-btn--primary calv-btn--sm" disabled={!canSave || pending}
             style={!canSave || pending ? { opacity: 0.45, cursor: "not-allowed" } : undefined} onClick={onSave}>
@@ -124,6 +161,15 @@ export function IntegrationsClient({ initial }: { initial: HmisSettingsView }) {
             Sync itself runs from <Link className="tlink" href="/data">Data &amp; integrations</Link>.
           </span>
         </div>
+        {result ? (
+          <Notice tone={result.ok ? "good" : "warn"} icon={result.ok ? "check" : "alert"}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {result.lines.map((line, i) => (
+                <div key={i} style={{ overflowWrap: "anywhere" }}>{line}</div>
+              ))}
+            </div>
+          </Notice>
+        ) : null}
         {initial.keysUnreadable ? (
           <Notice tone="warn" icon="alert">
             The stored keys can&apos;t be decrypted on this server — the encryption key (data/secret.key,

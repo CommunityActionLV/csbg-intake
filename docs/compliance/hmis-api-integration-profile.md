@@ -159,6 +159,127 @@ demographic columns are the expected spellings and are **unverified** — a wron
 name makes CRQL answer 400 naming the column, and the 400 body is surfaced
 verbatim.
 
+## Stored procedure as the client source
+
+The HUD elements the MOU names (`HealthInsuranceType`, `SourceOfIncome`,
+`NonCashBenefits`) are not on `cmClient`, not on `Enrollment`, and CRQL permits
+**at most one join** — so no single CRQL query can assemble them. Eccovia's
+answer is a procedure built in ClientTrack's Query Designer, exported, and
+called through `POST /crql/storedprocedures/{name}`.
+
+**The setting is the switch.** Settings → Integrations has a *Stored procedure*
+field: set it and the sync pulls from the procedure; leave it blank and the sync
+uses the CRQL `cmClient` query above. There is no separate mode toggle, and the
+CRQL path stays fully supported — it is the working default while Eccovia
+finishes enabling our procedure.
+
+- **The schema prefix is optional.** `C_Report_Example` and
+  `dbo.C_Report_Example` both return 200 with identical payloads (verified), so
+  the name is neither required to carry a prefix nor given one. It is stored
+  **exactly as typed** after trimming, and sent that way — CTAPI echoes the name
+  back verbatim in errors, so sending anything else makes those errors confusing.
+- The name lands in a URL path segment, so validation is a security boundary:
+  `^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$` and nothing else. Anything
+  with a slash, backslash, `?`, `#`, `%`, `..`, whitespace or a second dot is
+  **rejected**, never sanitized and used anyway; the segment is URL-encoded on
+  top of that.
+- Parameters are a JSON object, `{}` when the procedure takes none, validated at
+  save so a syntax error can't wait until sync time.
+- `pageNo`/`pageSize` are documented for `/crql` only and are **not** sent here.
+  Page size remains a CRQL setting.
+
+> **This endpoint executes whatever is named.** Eccovia's own documented
+> examples are write procedures (`dbo.Merge_Client`, `dbo.Delete_Client`), and
+> nothing in the API distinguishes a read from a write. These credentials point
+> at PA_HMIS production, so only a read-only report procedure belongs in that
+> field. Test connection runs it too — that is what testing it means.
+
+### Response handling
+
+The stored-procedure envelope is **not** the CRQL one. Verified live (200,
+~10.8 KB):
+
+```json
+{ "output": [], "result": { "table1": [ { …one object per row… } ] } }
+```
+
+`result`, not `data`. Lowercase `table1`, not `Table1`. No `recordCount`, no
+`cacheExpirationDate`, no `__crql_rid`. Reading it with the CRQL spellings finds
+nothing and produces a **silent zero-row sync**, which is exactly what happened.
+The two endpoints therefore have two separate unwrappers — `crqlRows()` and
+`procedureResult()` — rather than one helper guessing between them.
+
+`procedureResult()` also handles, without throwing: a bare `{}` (zero rows), a
+message-only body, additional result sets (`table2`, … — `table1` is used for
+rows and the others are named in the sync result), and a non-empty `output`
+array of procedure output parameters, which is reported rather than dropped.
+
+### The 21 columns, and what happens to them
+
+Keys are read **by exact string**. The payload mixes `clientID`, `firstName`,
+`sexGender` and five space-separated names in one object, so there is no
+convention to derive and nothing is auto-camelCased. `clientID` in particular is
+not `ClientID` — the CRQL-era key list missed it, which would have dropped every
+row for want of an ID even after the envelope was fixed.
+
+Mapped to client fields: `clientID`, `firstName`, `lastName`, `dob`, `sex`,
+`gender`, `sexGender`, `race`, `veteranStatus`, `insurance`,
+`source of Cash Income`, `source of NonCash Income`.
+
+Received and **not** stored, reported on every sync so this stays visible:
+`enrollDate`, `exitDate`, `programName`, `relationship`, `age`,
+`age at Enrollment`, `income`, `enrolled Family Members`,
+`enrolled Member Count`.
+
+- **`income` is deliberately not imported.** It would feed FPL and eligibility
+  determinations; that stays a human step behind the existing "verify income &
+  eligibility" flag rather than a vendor figure flowing in unchecked.
+- **`enrolled Family Members` is deliberately not parsed.** Entries are
+  `Last, First | MM/DD/YYYY` joined by commas, so the comma is both the
+  intra-record and the inter-record separator — the split is genuinely
+  ambiguous. Household composition comes from per-client rows instead.
+
+Anything outside both lists is reported as an unmapped column, so a new column
+is discovered rather than silently ignored.
+
+### Values are labels, not HUD codes
+
+`race` arrives as `"Black, African American, or African"`, not `3`; `insurance`
+as `"Medicaid"`; `veteranStatus` as `"No"`. CAP Trellis stores CSBG AR 3.0
+instrument options, and `canonicalCharacteristic()` returns null for anything it
+doesn't recognize, so **the raw label is stored as-is and never coerced to a
+default**. Every non-matching label is now also reported — sync result, audit
+row and a `[hmis]` warning — because HUD changed its race wording in 2024 and
+CaseWorthy can change a label at any time; silent recategorization would turn a
+vendor wording change into quiet data corruption. A configurable source-value →
+CSBG-value crosswalk is planned to close this properly.
+
+### Unsettled: one row per client, or one per household?
+
+A sample row carries `relationship: "Self"` with `enrolled Member Count: 6` and
+the other members flattened into `enrolled Family Members`. Whether the
+procedure returns one row per enrolled client or one row per household is **not
+established**, and if it is the latter a naive import misses dependents. Nothing
+guesses or works around it: both Run sync and Test connection report the row
+count and the distinct `relationship` values found, so it can be settled from
+real data.
+
+### 401 means three different things
+
+CTAPI answers `401` for three unrelated problems and only the body's prose
+separates them, so each gets its own message:
+
+| Body contains | Reported as |
+|---|---|
+| `missing subscription key` | Subscription key rejected — check the Subscription Key setting. |
+| `missing or incorrect ApiKey` | API key rejected — check the API Key setting. |
+| `is not available at this time` | Eccovia has not enabled `<name>` for this subscription — **not** a credential problem; contact CaseWorthy support to add the procedure to your execution scope. |
+
+The third is our live state today. None of the three is retried. A `500` comes
+back with a literally empty body for an invalid procedure or object, so the
+procedure name and its parameter *keys* (never values) are logged alongside any
+5xx — otherwise a typo and a server fault are indistinguishable.
+
 ## Configuration
 
 Primary: **Settings → Integrations** (admin-only) — base URL, subscription key,
@@ -182,7 +303,9 @@ HMIS_BASE_URL=          # optional, default https://api.clienttrack.net
 HMIS_SUBSCRIPTION_KEY=  # Ocp-Apim-Subscription-Key
 HMIS_API_KEY=           # Authorization: ApiKey <key>
 HMIS_ORG_ID=            # optional, User Keys only
-HMIS_PAGE_SIZE=         # optional, default 200, max 500
+HMIS_PAGE_SIZE=         # optional, default 200, max 500 (CRQL only)
+HMIS_STORED_PROCEDURE=  # optional; set = the client source, blank = CRQL query
+HMIS_STORED_PROCEDURE_PARAMS=  # optional JSON object, default {}
 ```
 
 Credentials rest inside the app database (encrypted) or the server's

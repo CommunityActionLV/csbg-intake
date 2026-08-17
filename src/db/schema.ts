@@ -405,16 +405,31 @@ export const matchReviews = pgTable("match_reviews", {
 });
 
 // Spreadsheet import history (Data & integrations → Import spreadsheet)
+/** What an HMIS sync did to records that already existed, so undo can put them
+    back. Created clients need none of this — they carry `import_job_id` and are
+    deleted outright — but links, queued reviews and blank-fills all landed on
+    records that must survive an undo. */
+export interface HmisSyncUndo {
+  /** (system, external id) links this sync wrote. */
+  links: Array<{ system: string; externalId: string }>;
+  /** hmis_reviews rows this sync queued. */
+  reviewIds: number[];
+  /** Blank fields this sync filled, with the values that were there before. */
+  enriched: Array<{ clientId: string; before: Record<string, unknown> }>;
+}
+
 export const importJobs = pgTable("import_jobs", {
   id: integer("id").primaryKey().generatedByDefaultAsIdentity(),
   at: text("at").notNull(),                     // ISO datetime
-  template: text("template").notNull(),         // 'pantry' | 'seminars' | 'volunteers'
-  filename: text("filename").notNull(),
+  template: text("template").notNull(),         // 'clients' | 'pantry' | 'hmis' | …
+  filename: text("filename").notNull(),         // or the sync's source, for 'hmis'
   imported: integer("imported").notNull().default(0),
   updated: integer("updated").notNull().default(0),
   skipped: integer("skipped").notNull().default(0),
   staffId: text("staff_id").notNull(),
   detail: text("detail").notNull().default(""),
+  // reversal record for template 'hmis' (see HmisSyncUndo)
+  hmisUndo: jsonb("hmis_undo").$type<HmisSyncUndo>(),
 });
 
 // ---------- Audit log ----------

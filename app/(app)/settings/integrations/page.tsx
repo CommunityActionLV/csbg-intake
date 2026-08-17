@@ -14,12 +14,16 @@ export default async function IntegrationsSettingsPage() {
   const { source } = await getHmisConfig();
 
   // Only ever booleans for the keys — the ciphertext stays server-side too.
+  // The procedure name and its parameters are not secrets and round-trip.
+  const params = stored.storedProcedureParams ?? {};
   const view: HmisSettingsView = {
     baseUrl: stored.baseUrl ?? CTAPI_BASE_URL,
     hasSubscriptionKey: Boolean(stored.subscriptionKey),
     hasApiKey: Boolean(stored.apiKey),
     orgId: stored.orgId ?? "",
     pageSize: stored.pageSize ?? 200,
+    storedProcedure: stored.storedProcedure ?? "",
+    storedProcedureParams: JSON.stringify(params, null, 2),
     source,
     envConfigured: hmisConfig() !== null,
     keysUnreadable: await hmisKeysUnreadable(),

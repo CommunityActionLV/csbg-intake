@@ -61,13 +61,16 @@ export default async function DataPage() {
     .map((j) => ({
       id: j.id,
       when: shortDate(localDateOf(j.at)),
-      template: importTemplate(j.template)?.name ?? j.template,
+      // HMIS syncs are logged as import jobs so they share Recent imports and
+      // its Undo, but they aren't spreadsheet templates and have no entry there
+      template: j.template === "hmis" ? "PA HMIS sync" : importTemplate(j.template)?.name ?? j.template,
       filename: j.filename,
       imported: j.imported,
       updated: j.updated,
       skipped: j.skipped,
       staffInitials: staff.get(j.staffId) ?? j.staffId,
-      canUndo: j.template === "clients",
+      canUndo: j.template === "clients" || j.template === "hmis",
+      isSync: j.template === "hmis",
     }));
 
   // PA HMIS panel — sync state, pending link/dismiss reviews

@@ -14,6 +14,8 @@ const cfg = (over: Partial<HmisConfig> = {}): HmisConfig => ({
   apiKey: "api-key-placeholder",
   orgId: "",
   pageSize: 200,
+  storedProcedure: "",           // blank = these all exercise the CRQL path
+  storedProcedureParams: {},
   ...over,
 });
 
