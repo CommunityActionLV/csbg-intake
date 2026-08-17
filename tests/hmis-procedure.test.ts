@@ -51,6 +51,11 @@ function stub(bodies: unknown[], status = 200) {
 const envelope = (rows: Array<Record<string, unknown>>, extra: Record<string, unknown> = {}) =>
   ({ output: [], result: { table1: rows, ...extra } });
 
+/** What /crql returns — a different envelope entirely, which is the whole point.
+    The CRQL fallback has to be fed this shape, not the one above. */
+const crqlEnvelope = (rows: Array<Record<string, unknown>>) =>
+  ({ recordCount: rows.length, cacheExpirationDate: null, data: { Table1: rows } });
+
 /** A row in the procedure's real key style: camelCase, a lowercase-first
     `clientID`, and space-separated names in the same object. Values are
     placeholders, never real client data. */
@@ -92,7 +97,7 @@ describe("the setting is the switch", () => {
   });
 
   it("falls back to the CRQL query when the field is blank — unchanged behaviour", async () => {
-    const { calls, opts } = stub([envelope([person(1)])]);
+    const { calls, opts } = stub([crqlEnvelope([person(1)])]);
     const pull = await fetchHmisClients(cfg({ storedProcedure: "" }), opts);
     expect(calls[0].method).toBe("GET");
     expect(calls[0].url.pathname).toBe("/crql");
