@@ -10,4 +10,6 @@ next-env.d.ts
 .env*
 !.env.example
 data/uploads/
+# encryption key for stored third-party credentials — never commit, back up separately
+data/secret.key
 .claude-snapshot/

@@ -82,7 +82,7 @@ export function HmisPanel({ configured, stats, reviews, programs, programId }: {
           <button className="calv-btn calv-btn--quiet calv-btn--sm" disabled={pending} onClick={onTest}>Test connection</button>
           <button className="calv-btn calv-btn--secondary calv-btn--sm" disabled={pending || !configured}
             style={!configured ? { opacity: 0.45, cursor: "not-allowed" } : undefined}
-            title={configured ? undefined : "Add the HMIS_* settings to .env.local first"}
+            title={configured ? undefined : "Set the PA HMIS connection in Settings → Integrations first"}
             onClick={onSync}>
             <I name="rotate" size={13} /> Run sync
           </button>

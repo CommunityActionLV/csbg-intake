@@ -127,6 +127,33 @@ async function main(): Promise<void> {
   check("match_reviews jsonb payload typed", pendingReviews[0]?.payload.client.first === "Ana"
     && Array.isArray(pendingReviews[0]?.candidateIds));
 
+  // HMIS syncs are logged as import jobs so they appear in Recent imports with
+  // an Undo button; hmis_undo carries what the sync did to records that already
+  // existed, which is the half undo can't derive from import_job_id.
+  const [syncJob] = await db.insert(t.importJobs).values({
+    at: new Date().toISOString(), template: "hmis", filename: "dbo.Example_API",
+    imported: 2, updated: 1, skipped: 0, staffId: users[0].id, detail: "smoke",
+    hmisUndo: {
+      links: [{ system: "hmis", externalId: "H1" }],
+      reviewIds: [7],
+      enriched: [{ clientId: clients[0].id, before: { phone: null, custom: {} } }],
+    },
+  }).returning({ id: t.importJobs.id });
+  const storedJob = (await db.select().from(t.importJobs).where(eq(t.importJobs.id, syncJob.id)))[0];
+  check("import_jobs accepts an hmis sync entry", storedJob?.template === "hmis",
+    `${storedJob?.template} · ${storedJob?.filename}`);
+  check("import_jobs.hmis_undo jsonb round-trip",
+    storedJob?.hmisUndo?.links[0]?.externalId === "H1"
+    && storedJob?.hmisUndo?.reviewIds[0] === 7
+    && storedJob?.hmisUndo?.enriched[0]?.before.phone === null);
+
+  const [sheetJob] = await db.insert(t.importJobs).values({
+    at: new Date().toISOString(), template: "clients", filename: "legacy.csv",
+    imported: 1, updated: 0, skipped: 0, staffId: users[0].id, detail: "smoke",
+  }).returning({ id: t.importJobs.id });
+  const storedSheet = (await db.select().from(t.importJobs).where(eq(t.importJobs.id, sheetJob.id)))[0];
+  check("import_jobs.hmis_undo is null for a spreadsheet import", storedSheet?.hmisUndo === null);
+
   await pglite.close();
 
   // ---------- Production init path (CSBG_DEMO_SEED=0 → /setup wizard) ----------
