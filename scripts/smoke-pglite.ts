@@ -153,6 +153,50 @@ async function main(): Promise<void> {
   }).returning({ id: t.importJobs.id });
   const storedSheet = (await db.select().from(t.importJobs).where(eq(t.importJobs.id, sheetJob.id)))[0];
   check("import_jobs.hmis_undo is null for a spreadsheet import", storedSheet?.hmisUndo === null);
+  // ---------- Multi-program enrollment (imports add a program, not a twin) ----------
+  // One person, two programs, services attributed per program: the shape the
+  // CSBG report depends on to split services while counting the client once.
+  const multi = clients[0].id;
+  const progsBefore = (await db.select().from(t.clientPrograms)
+    .where(eq(t.clientPrograms.clientId, multi))).map((m) => m.programId);
+  const second = (await db.select().from(t.programs)).map((p) => p.id).find((id) => !progsBefore.includes(id))!;
+  await db.insert(t.clientPrograms).values({ clientId: multi, programId: second });
+  const progsAfter = (await db.select().from(t.clientPrograms)
+    .where(eq(t.clientPrograms.clientId, multi))).map((m) => m.programId);
+  check("client enrolled in a second program (no duplicate client row)",
+    progsAfter.length === progsBefore.length + 1 && progsAfter.includes(second)
+    && (await db.select().from(t.clients)).length === clients.length,
+    progsAfter.join(" + "));
+  // composite PK makes a repeat enrollment a hard error — the importer checks first
+  const repeat = await db.insert(t.clientPrograms).values({ clientId: multi, programId: second })
+    .onConflictDoNothing().returning({ programId: t.clientPrograms.programId });
+  check("re-enrolling in the same program is a no-op", repeat.length === 0);
+  await db.insert(t.serviceLog).values({
+    date: "2026-06-12", clientId: multi, code: "SDA 1a", programId: second, staffId: "dr", note: "smoke multi",
+  });
+  const perProgram = (await db.select().from(t.serviceLog)).filter((s) => s.clientId === multi);
+  check("services attribute to distinct programs for one client",
+    new Set(perProgram.map((s) => s.programId)).size >= 2,
+    [...new Set(perProgram.map((s) => s.programId))].join(" + "));
+
+  // import_jobs.additions — what undo needs to reverse enrollments added to
+  // clients that already existed (they carry no import_job_id)
+  const [addJob] = await db.insert(t.importJobs).values({
+    at: "2026-07-31T00:00:00Z", template: "clients", filename: "multi.xlsx",
+    imported: 0, updated: 1, skipped: 0, staffId: "dr",
+    additions: { enrollments: [{ clientId: multi, programId: second }], serviceLogIds: [inserted[0].id] },
+  }).returning({ id: t.importJobs.id });
+  const storedAddJob = (await db.select().from(t.importJobs).where(eq(t.importJobs.id, addJob.id)))[0];
+  check("import_jobs.additions jsonb round-trip",
+    storedAddJob?.additions?.enrollments[0]?.programId === second
+    && Array.isArray(storedAddJob?.additions?.serviceLogIds));
+  // an import that touched nobody pre-existing stores no additions
+  const [plainJob] = await db.insert(t.importJobs).values({
+    at: "2026-07-31T00:00:00Z", template: "clients", filename: "plain.xlsx",
+    imported: 3, updated: 0, skipped: 0, staffId: "dr",
+  }).returning({ id: t.importJobs.id });
+  check("import_jobs.additions is null when nothing was added",
+    (await db.select().from(t.importJobs).where(eq(t.importJobs.id, plainJob.id)))[0]?.additions == null);
 
   await pglite.close();
 

@@ -6,7 +6,7 @@ import { revalidatePath } from "next/cache";
 import { and, eq, inArray } from "drizzle-orm";
 import { readSheet } from "@/lib/spreadsheet";
 import { db, t } from "@/db";
-import type { HeldClientPayload } from "@/db/schema";
+import type { HeldClientPayload, ImportAdditions } from "@/db/schema";
 import { classifyMatches, matchKey } from "@/lib/matching";
 import { requireAdmin } from "@/lib/auth";
 import { audit, getPrograms } from "@/lib/access";
@@ -59,10 +59,13 @@ export interface ImportSummary {
   /** rows held in the duplicate review queue — resolved on the Data page */
   queued: number;
   errors: string[];
+  /** rows that landed with something worth reporting — e.g. an existing client
+      enrolled in an additional program. Not failures; shown apart from errors. */
+  notes: string[];
 }
 
 const fail = (message: string): ImportSummary =>
-  ({ ok: false, message, imported: 0, updated: 0, skipped: 0, queued: 0, errors: [] });
+  ({ ok: false, message, imported: 0, updated: 0, skipped: 0, queued: 0, errors: [], notes: [] });
 
 const num = (s: string): number | null => {
   const t = s.trim();
@@ -157,10 +160,15 @@ export async function commitImport(
   let imported = 0;
   let updated = 0;
   const errors: string[] = [];
+  const notes: string[] = [];
   const createdClientIds: string[] = []; // tagged with the import job id below → enables undo
+  // What this import added to clients that already existed — those records carry
+  // no import_job_id, so undo reverses them from here (see ImportAdditions).
+  const additions: ImportAdditions = { enrollments: [], serviceLogIds: [] };
   // Near-matches held for human review ("conflicts queue — nothing merges silently").
   const held: Array<{ rowNo: number; payload: HeldClientPayload; candidateIds: string[] }> = [];
   const skip = (rowNo: number, why: string) => errors.push(`Row ${rowNo}: ${why}`);
+  const note = (rowNo: number, what: string) => notes.push(`Row ${rowNo}: ${what}`);
 
   if (tpl.id === "clients") {
     // ---- client migration (legacy-system cutover) ----
@@ -175,7 +183,27 @@ export async function commitImport(
       id: t.clients.id, first: t.clients.first, last: t.clients.last,
       dob: t.clients.dob, phone: t.clients.phone,
     }).from(t.clients);
-    const seen = new Set(candidates.map(matchKey));
+    // Exact identity (normalized name + DOB) → the client already on file. A
+    // repeat of the same person is NOT a duplicate to drop: a legacy export
+    // lists someone once per program, so the row's job becomes additive —
+    // enroll them in the program they're missing and log the service that came
+    // with it. Grows as rows create clients, so a second row for the same
+    // person in one file enrolls them rather than creating a twin.
+    const byKey = new Map(candidates.map((c) => [matchKey(c), c.id]));
+    // Current enrollments, so a program is only added when genuinely missing.
+    const enrolledByClient = new Map<string, string[]>();
+    for (const cp of await db.select().from(t.clientPrograms)) {
+      enrolledByClient.set(cp.clientId, [...(enrolledByClient.get(cp.clientId) ?? []), cp.programId]);
+    }
+    // Service-log idempotency: re-importing the same sheet must not stack a
+    // second copy of an entry already on record. Keyed WITHOUT the note, unlike
+    // the service-history template — the note here is generated rather than
+    // taken from the sheet, so one person + service + date is one fact however
+    // the row reached us (new client or additional enrollment).
+    const logSeen = new Set(
+      (await db.select({
+        clientId: t.serviceLog.clientId, code: t.serviceLog.code, date: t.serviceLog.date,
+      }).from(t.serviceLog)).map((r) => `${r.clientId}|${r.code}|${r.date}`));
     const org = (await db.select().from(t.organization).where(eq(t.organization.id, 1)))[0];
     const active = await getActiveFpl(); // default when a row names no guideline year
     const schedules = await getFplHistory();
@@ -194,10 +222,14 @@ export async function commitImport(
       staffByRef.set(u.initials.toLowerCase(), u.id);
       staffByRef.set(u.id.toLowerCase(), u.id);
     }
-    // legacy-ID linkage: a (system, id) pair already on file means the row
-    // was imported before — idempotent re-imports skip it by ID, not by name
-    const extPairs = new Set(
-      (await db.select().from(t.clientExternalIds)).map((r) => `${r.system}|${r.externalId.toLowerCase()}`));
+    // legacy-ID linkage: a (system, id) pair already on file means the row was
+    // imported before — idempotent re-imports skip it by ID, not by name. The
+    // value is the client that owns the pair (null once a row held for review
+    // claims it), so a pair already pointing at THIS person can fall through to
+    // the additive path instead of being read as somebody else's record.
+    const extPairs = new Map<string, string | null>(
+      (await db.select().from(t.clientExternalIds))
+        .map((r) => [`${r.system}|${r.externalId.toLowerCase()}`, r.clientId]));
     const now = new Date().toISOString();
     const today = todayIso();
     // characteristics canonicalize where possible; unmappable values import
@@ -213,7 +245,9 @@ export async function commitImport(
       const dob = parseDateIso(cell(row, "dob"));
       if (!dob) { skip(rowNo, `date of birth “${cell(row, "dob")}” — use a format like 2001-05-14`); continue; }
       const key = matchKey({ first, last, dob });
-      if (seen.has(key)) { skip(rowNo, `${first} ${last} (${dob}) already has a client record`); continue; }
+      // Already on file? Validate the rest of the row first, then take the
+      // additive path below — the program and service still have to land.
+      const existingId = byKey.get(key);
       const programRef = cell(row, "program");
       const programId = programByRef.get(programRef.toLowerCase());
       if (!programId) { skip(rowNo, programRef ? `no program matches “${programRef}”` : "missing program"); continue; }
@@ -293,8 +327,14 @@ export async function commitImport(
       const legacySystem = (cell(row, "legacySystem") || "legacy").trim().toLowerCase();
       const legacyPair = legacyIdRaw ? `${legacySystem}|${legacyIdRaw.toLowerCase()}` : null;
       if (legacyPair && extPairs.has(legacyPair)) {
-        skip(rowNo, `legacy ID “${legacyIdRaw}” (${legacySystem}) is already linked to a client record`);
-        continue;
+        // Linked to the very person this row names → the multi-program case;
+        // fall through so the extra enrollment lands. Linked to anyone else (or
+        // to a row already held for review) stays a skip — that's a conflict.
+        const owner = extPairs.get(legacyPair);
+        if (!owner || owner !== existingId) {
+          skip(rowNo, `legacy ID “${legacyIdRaw}” (${legacySystem}) is already linked to ${owner ?? "another imported row"}`);
+          continue;
+        }
       }
       const externalId = legacyIdRaw ? { system: legacySystem, id: legacyIdRaw } : undefined;
       // Remaining All Characteristics Report fields (C3/C5/C7/C8/D13 + the C4
@@ -322,6 +362,57 @@ export async function commitImport(
         if (isYes(dyRaw)) custom.disconnectedYouth = "Yes";
         else if (isNo(dyRaw)) custom.disconnectedYouth = "No";
         else { skip(rowNo, `disconnected youth “${dyRaw}” — use Yes or No (blank = unknown)`); continue; }
+      }
+
+      // ---- Already on file: add the program, never rewrite the person ----
+      // A client enrolled in more than one program appears once per program in a
+      // legacy export. Identity is settled (exact name + DOB), so this row adds
+      // the missing enrollment and its service and leaves every stored
+      // characteristic alone — a sheet must not silently overwrite case notes,
+      // income, or a pinned guideline year on an established record.
+      if (existingId) {
+        const already = enrolledByClient.get(existingId) ?? [];
+        const addedProgram = !already.includes(programId);
+        if (addedProgram) {
+          await db.insert(t.clientPrograms).values({ clientId: existingId, programId });
+          enrolledByClient.set(existingId, [...already, programId]);
+          additions.enrollments.push({ clientId: existingId, programId });
+        }
+        let addedService = false;
+        if (serviceCode) {
+          const dupKey = `${existingId}|${serviceCode}|${serviceDate}`;
+          if (!logSeen.has(dupKey)) {
+            const [logged] = await db.insert(t.serviceLog).values({
+              date: serviceDate,
+              clientId: existingId,
+              code: serviceCode,
+              programId,
+              staffId: user.id,
+              note: "Imported service — existing client record",
+            }).returning({ id: t.serviceLog.id });
+            logSeen.add(dupKey);
+            if (logged) additions.serviceLogIds.push(logged.id);
+            addedService = true;
+          }
+        }
+        if (externalId) {
+          await db.insert(t.clientExternalIds)
+            .values({ system: externalId.system, externalId: externalId.id, clientId: existingId, linkedAt: now, linkedBy: user.id })
+            .onConflictDoNothing();
+          extPairs.set(legacyPair!, existingId);
+        }
+        // Nothing new to add is the genuine re-import case — say so plainly
+        // rather than reporting an update that changed nothing.
+        if (addedProgram || addedService) {
+          const what = addedProgram && addedService ? `enrolled in ${programId} and a service logged`
+            : addedProgram ? `enrolled in ${programId}`
+            : "a service logged";
+          note(rowNo, `${first} ${last} (${dob}) is already on file as ${existingId} — ${what}`);
+          updated++;
+        } else {
+          skip(rowNo, `${first} ${last} (${dob}) is already on file as ${existingId} and enrolled in ${programId} — nothing to add`);
+        }
+        continue;
       }
 
       // Not an exact record, but close to one (same last name + DOB, or a
@@ -358,7 +449,7 @@ export async function commitImport(
           },
           candidateIds: possible.map((m) => m.client.id),
         });
-        if (legacyPair) extPairs.add(legacyPair);
+        if (legacyPair) extPairs.set(legacyPair, null);
         continue;
       }
 
@@ -398,14 +489,18 @@ export async function commitImport(
           staffId: user.id,
           note: "Imported with client record",
         });
+        logSeen.add(`${clientId}|${serviceCode}|${serviceDate}`);
       }
       if (externalId) {
         await db.insert(t.clientExternalIds)
           .values({ system: externalId.system, externalId: externalId.id, clientId, linkedAt: now, linkedBy: user.id })
           .onConflictDoNothing();
-        extPairs.add(legacyPair!);
+        extPairs.set(legacyPair!, clientId);
       }
-      seen.add(key);
+      // A later row naming this same person now resolves to the record just
+      // created — it adds a second program instead of a duplicate client.
+      byKey.set(key, clientId);
+      enrolledByClient.set(clientId, [programId]);
       createdClientIds.push(clientId);
       imported++;
     }
@@ -728,6 +823,8 @@ export async function commitImport(
     skipped,
     staffId: user.id,
     detail: errors.slice(0, 12).join(" · "),
+    // only recorded when the import touched pre-existing clients
+    additions: additions.enrollments.length || additions.serviceLogIds.length ? additions : null,
   }).returning({ id: t.importJobs.id });
   // Tag the rows this client-migration import created so it can be undone later.
   if (createdClientIds.length > 0) {
@@ -755,12 +852,15 @@ export async function commitImport(
   const queuedNote = queued
     ? ` ${fmt(queued)} row${queued === 1 ? " is" : "s are"} held for duplicate review below — nothing merges silently.`
     : "";
+  const enrolledNote = additions.enrollments.length
+    ? ` ${fmt(additions.enrollments.length)} existing client${additions.enrollments.length === 1 ? " was" : "s were"} enrolled in an additional program.`
+    : "";
   const message = imported + updated > 0
-    ? `Import complete — ${fmt(imported)} added and ${fmt(updated)} updated in ${tpl.target}${skipped ? `; ${fmt(skipped)} row${skipped === 1 ? "" : "s"} skipped` : ""}.${queuedNote}`
+    ? `Import complete — ${fmt(imported)} added and ${fmt(updated)} updated in ${tpl.target}${skipped ? `; ${fmt(skipped)} row${skipped === 1 ? "" : "s"} skipped` : ""}.${enrolledNote}${queuedNote}`
     : queued > 0
       ? `No rows imported directly.${queuedNote}`
       : `Nothing imported — all ${fmt(skipped)} row${skipped === 1 ? "" : "s"} were skipped. Check the row notes below.`;
-  return { ok: true, message, imported, updated, skipped, queued, errors };
+  return { ok: true, message, imported, updated, skipped, queued, errors, notes };
 }
 
 /* ---------- Duplicate review queue ---------- */
@@ -895,18 +995,47 @@ export async function undoImport(jobId: number): Promise<UndoResult> {
   // reviews, blank-filled fields. Deleting those clients would be wrong, so the
   // sync recorded what it did and undo reverses exactly that.
   const reverted = job.template === "hmis" ? await revertHmisSync(job.hmisUndo) : null;
+  // Additions to clients that already existed: those records must SURVIVE the
+  // undo (they predate the import), so only the enrollment and the service rows
+  // this job created for them come back out.
+  const additions = job.additions;
+  const reverseAdditions = async () => {
+    for (const e of additions?.enrollments ?? []) {
+      await db.delete(t.clientPrograms)
+        .where(and(eq(t.clientPrograms.clientId, e.clientId), eq(t.clientPrograms.programId, e.programId)));
+    }
+    if (additions?.serviceLogIds?.length) {
+      await db.delete(t.serviceLog).where(inArray(t.serviceLog.id, additions.serviceLogIds));
+    }
+  };
+  const addedBack = additions?.enrollments.length ?? 0;
+  const addedNote = addedBack
+    ? ` ${fmt(addedBack)} added program enrollment${addedBack === 1 ? "" : "s"} on existing clients ${addedBack === 1 ? "was" : "were"} also removed.`
+    : "";
 
   const targets = await db.select({ id: t.clients.id }).from(t.clients).where(eq(t.clients.importJobId, jobId));
   const ids = targets.map((c) => c.id);
   if (ids.length === 0) {
+    // An import can legitimately create nobody and still have work to reverse —
+    // e.g. a sheet that only added second-program enrollments to existing clients.
+    await reverseAdditions();
     await db.delete(t.importJobs).where(eq(t.importJobs.id, jobId));
     const undone = reverted ? ` ${reverted}` : "";
+    if (addedBack || reverted) {
+      await audit(user.id, job.template === "hmis" ? "hmis.sync.undo" : "data.import.undo",
+        "integration", job.template === "hmis" ? "hmis" : "sheets",
+        `${job.filename} · no client records created`
+        + (addedBack ? ` · ${addedBack} added enrollment${addedBack === 1 ? "" : "s"} reversed` : "")
+        + (reverted ? ` · ${reverted}` : ""));
+      revalidatePath("/", "layout");
+    }
     return {
       ok: true,
-      message: `No client records were created by that ${job.template === "hmis" ? "sync" : "import"} — the log entry was cleared.${undone}`,
       removed: 0,
+      message: `No client records were created by that ${job.template === "hmis" ? "sync" : "import"} — the log entry was cleared.${undone}${addedNote}`,
     };
   }
+  await reverseAdditions();
 
   // Client-owned rows (NOT NULL client_id) — remove outright.
   await db.delete(t.clientPrograms).where(inArray(t.clientPrograms.clientId, ids));
@@ -930,14 +1059,15 @@ export async function undoImport(jobId: number): Promise<UndoResult> {
   await audit(user.id, job.template === "hmis" ? "hmis.sync.undo" : "data.import.undo",
     "integration", job.template === "hmis" ? "hmis" : "sheets",
     `${job.filename} · ${ids.length} imported client${ids.length === 1 ? "" : "s"} removed`
-    + `${reverted ? ` · ${reverted}` : ""}`);
+    + (addedBack ? `, ${addedBack} added enrollment${addedBack === 1 ? "" : "s"} reversed` : "")
+    + (reverted ? ` · ${reverted}` : ""));
   revalidatePath("/", "layout");
 
   return {
     ok: true,
     removed: ids.length,
     message: `${job.template === "hmis" ? "Sync" : "Import"} undone — removed ${fmt(ids.length)} imported client`
-      + `${ids.length === 1 ? "" : "s"} and their enrollments.${reverted ? ` ${reverted}` : ""}`,
+      + `${ids.length === 1 ? "" : "s"} and their enrollments.${reverted ? ` ${reverted}` : ""}${addedNote}`,
   };
 }
 
