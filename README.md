@@ -129,28 +129,6 @@ Three supported paths, by agency capacity — all detailed in `deploy/README.md`
   builder, answer lists, per-program service catalogs, integrations, database health
   + backup
 
-## PA HMIS integration
-
-Sync with PA HMIS (Eccovia ClientTrack/CaseWorthy) under the signed PA DCED MOU
-and the CACLV ↔ PA HMIS operating understanding. The connection is configured in
-**Settings → Integrations** — saved to the database and applied immediately, no
-shell access or restart needed; credentials are write-only (never returned to the
-browser, never audited), and `HMIS_*` environment variables remain as an
-ops-managed fallback.
-
-Behavior per HMIS person: already linked → fill blank fields only (local data
-always wins); exact name+DOB → auto-link and blank-fill (audited); near match →
-review queue (link / import as new client / dismiss, and dismissals stick); no
-match → imported as a client record into the configured HMIS enrollment program,
-flagged for income & eligibility verification, with the FPL year pinned to the
-active schedule. Records without a date of birth stay snapshot-only. The
-admin-only `hmis_clients` snapshot is fully replaced on each sync. `/reports`
-gains an organization-wide unduplicated count across both systems — counts only,
-no identifying fields. **No SSN is stored in any form.**
-
-The transport is under active development; the operating understanding, security
-conditions, current verification status, and the electronic-file disposition
-procedure are in `docs/compliance/hmis-api-integration-profile.md`.
 
 ## Compliance notes
 
