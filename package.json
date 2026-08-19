@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "redeploy": "bash scripts/redeploy.sh",
     "seed": "tsx src/db/seed-cli.ts",
     "smoke": "tsx scripts/smoke-pglite.ts",
     "mfa:reset": "tsx scripts/mfa-reset.ts"

@@ -10,26 +10,42 @@ import { audit } from "@/lib/access";
 import { kvGet, kvSet, nextClientId } from "@/lib/data/core";
 import { fmt, shortDate, todayIso } from "@/lib/format";
 import {
-  createClientFromHmis, fetchHmisClients, getHmisConfig, hmisToken, runHmisMatching,
+  createClientFromHmis, fetchHmisClients, getHmisConfig, hmisConnectionTest, runHmisMatching,
 } from "@/lib/hmis";
 
 export interface HmisActionResult { ok: boolean; message: string }
 
+/** Test connection reports its two steps separately — credentials and stored
+    procedure fail for unrelated reasons, and collapsing them sends people to
+    regenerate keys that were never the problem. */
+export interface HmisTestResult extends HmisActionResult { lines: string[] }
+
 const NOT_CONFIGURED =
   "HMIS isn't configured — set the connection in Settings → Integrations (or via HMIS_* environment variables).";
 
-/** Verify credentials reach the token endpoint. No data is pulled. */
-export async function testHmisConnection(): Promise<HmisActionResult> {
+/** GET /auth/test, then the configured stored procedure (if any). No client
+    data is stored either way. */
+export async function testHmisConnection(): Promise<HmisTestResult> {
   const user = await requireAdmin();
   const { cfg } = await getHmisConfig();
-  if (!cfg) return { ok: false, message: NOT_CONFIGURED };
-  try {
-    await hmisToken(cfg);
-  } catch (e) {
-    return { ok: false, message: `Could not authenticate with PA HMIS: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  await audit(user.id, "hmis.test", "integration", "hmis", "Token endpoint reachable, credentials accepted");
-  return { ok: true, message: "Connected — PA HMIS accepted the credentials." };
+  if (!cfg) return { ok: false, message: NOT_CONFIGURED, lines: [NOT_CONFIGURED] };
+  const { auth, procedure } = await hmisConnectionTest(cfg);
+  const lines = [
+    `Credentials: ${auth.ok ? "accepted" : "rejected"} — ${auth.message}`,
+    `Stored procedure: ${procedure.configured ? (procedure.ok ? "ran" : "failed") : "not set"} — ${procedure.message}`,
+  ];
+  await audit(user.id, "hmis.test", "integration", "hmis",
+    `Credentials ${auth.ok ? "accepted" : "rejected"}`
+    + `${auth.environment ? ` (${auth.environment} ClientTrack environment)` : ""}`
+    + `; stored procedure ${procedure.configured ? `${procedure.procedure} ${procedure.ok ? "ran" : "failed"}` : "not configured"}`
+    + `${procedure.columns.length ? ` — columns: ${procedure.columns.join(", ")}` : ""}`);
+  return {
+    ok: auth.ok && procedure.ok,
+    message: auth.ok && procedure.ok
+      ? (procedure.configured ? "Connected — credentials accepted and the stored procedure ran." : auth.message)
+      : (auth.ok ? procedure.message : auth.message),
+    lines,
+  };
 }
 
 /** Set the program HMIS-imported clients enroll into. */
@@ -51,15 +67,27 @@ export async function runHmisSync(): Promise<HmisActionResult> {
   const { cfg } = await getHmisConfig();
   if (!cfg) return { ok: false, message: NOT_CONFIGURED };
 
-  let rows;
+  let pull;
   try {
-    const token = await hmisToken(cfg);
-    rows = await fetchHmisClients(cfg, token);
+    pull = await fetchHmisClients(cfg);
   } catch (e) {
     return { ok: false, message: `Sync failed while pulling from PA HMIS: ${e instanceof Error ? e.message : String(e)}` };
   }
+  const rows = pull.rows;
   if (rows.length === 0) {
-    return { ok: false, message: "PA HMIS answered but returned no client records — check HMIS_CLIENTS_PATH against the API docs." };
+    // say which source came back empty, and what it did return — with an
+    // unverified procedure output, "no records" is usually a mapping problem
+    const where = pull.source === "procedure"
+      ? `the stored procedure ${pull.procedure}`
+      : "the CRQL query";
+    return {
+      ok: false,
+      message: `PA HMIS answered but ${where} produced no client records`
+        + `${pull.rawRowCount > 0 ? ` from ${fmt(pull.rawRowCount)} returned row(s)` : ""}.`
+        + `${pull.note ? ` ${pull.note}.` : pull.source === "crql"
+          ? " Verify the CRQL column names in CRQL_CLIENT_FIELDS against the API docs."
+          : ""}`,
+    };
   }
 
   // full-snapshot semantics: replace the table with this pull
@@ -70,14 +98,37 @@ export async function runHmisSync(): Promise<HmisActionResult> {
     await db.insert(t.hmisClients).values(rows.slice(i, i + CHUNK).map((r) => ({ ...r, fetchedAt: now })));
   }
 
+  // Logged as an import job before the pass runs, so created clients can carry
+  // its id — the same mechanism spreadsheet imports use, which is what puts this
+  // sync in Recent imports with an Undo button.
+  const source = pull.source === "procedure" ? `${pull.procedure}` : "CRQL query on cmClient";
+  const [job] = await db.insert(t.importJobs).values({
+    at: now,
+    template: "hmis",
+    filename: source,
+    imported: 0,
+    updated: 0,
+    skipped: 0,
+    staffId: user.id,
+    detail: "",
+  }).returning({ id: t.importJobs.id });
+
   const programId = await kvGet<string | null>("hmisProgramId", null);
-  const stats = await runHmisMatching(rows, user.id, programId, nextClientId);
+  const { stats, undo } = await runHmisMatching(rows, user.id, programId, nextClientId, job.id);
+  await db.update(t.importJobs).set({
+    imported: stats.created,
+    updated: stats.enriched,
+    skipped: stats.noDob + stats.noProgram,
+    detail: `${fmt(rows.length)} pulled — ${stats.autoLinked} auto-linked, ${stats.queued} queued for review`,
+    hmisUndo: undo,
+  }).where(eq(t.importJobs.id, job.id));
   await kvSet("hmisSync", { at: now, pulled: rows.length, ...stats });
   await db.update(t.integrations)
     .set({ status: "connected", lastSync: shortDate(todayIso()), records: `${fmt(rows.length)} HMIS records` })
     .where(eq(t.integrations.id, "hmis"));
   await audit(user.id, "hmis.sync", "integration", "hmis",
-    `${fmt(rows.length)} pulled — ${stats.alreadyLinked} already linked, ${stats.autoLinked} auto-linked, ${stats.enriched} blank-filled, ${stats.created} imported as clients, ${stats.queued} queued for review${stats.noDob ? `, ${stats.noDob} without DOB` : ""}${stats.noProgram ? `, ${stats.noProgram} skipped (no enrollment program set)` : ""}`);
+    `${fmt(rows.length)} pulled from ${pull.source === "procedure" ? pull.procedure : "CRQL cmClient"}`
+    + `${pull.note ? ` [${pull.note}]` : ""} — ${stats.alreadyLinked} already linked, ${stats.autoLinked} auto-linked, ${stats.enriched} blank-filled, ${stats.created} imported as clients, ${stats.queued} queued for review${stats.noDob ? `, ${stats.noDob} without DOB` : ""}${stats.noProgram ? `, ${stats.noProgram} skipped (no enrollment program set)` : ""}`);
   revalidatePath("/data");
   revalidatePath("/reports");
   revalidatePath("/clients");
@@ -89,7 +140,20 @@ export async function runHmisSync(): Promise<HmisActionResult> {
   ];
   if (stats.noProgram > 0) parts.push(`${fmt(stats.noProgram)} skipped — set the enrollment program`);
   if (stats.noDob > 0) parts.push(`${fmt(stats.noDob)} kept snapshot-only (no DOB)`);
-  return { ok: true, message: `Synced ${fmt(rows.length)} HMIS records — ${parts.join(", ")}.` };
+  // A pull that stopped after exactly one full page can't be told apart from a
+  // result set that CRQL's mandatory TOP bounded before paging applied, so say
+  // so rather than presenting it as a complete snapshot.
+  const caveat = pull.singlePageCapped
+    ? ` This pull filled exactly one page (${fmt(rows.length)} records) and the next page was empty — confirm with PA HMIS that paging works inside SELECT TOP before treating it as the full statewide snapshot.`
+    : "";
+  // the procedure's output shape is unverified, so anything the mapping didn't
+  // understand is reported here rather than left in a server log
+  const sourceLabel = pull.source === "procedure" ? `${pull.procedure}` : "the CRQL query";
+  const mapping = pull.note ? ` Note: ${pull.note}.` : "";
+  return {
+    ok: true,
+    message: `Synced ${fmt(rows.length)} HMIS records from ${sourceLabel} — ${parts.join(", ")}.${caveat}${mapping}`,
+  };
 }
 
 /** Resolve a held HMIS near-match: link to a candidate, import as a new

@@ -55,6 +55,8 @@ export interface ImportJobRow {
   skipped: number;
   staffInitials: string;
   canUndo: boolean;
+  /** An HMIS sync rather than a spreadsheet import — undo reverses more. */
+  isSync: boolean;
 }
 
 const tone: Record<string, string> = { connected: "sage", attention: "amber", ready: "teal" };
@@ -196,11 +198,19 @@ export function DataClient({ integrations, matching, reviews, importJobs, progra
       {wizardOpen ? <ImportWizard onClose={() => setWizardOpen(false)} toast={toast} programs={programs} fplYears={fplYears} services={services} /> : null}
 
       {undoJob ? (
-        <Modal title="Undo this import?" width={460} onClose={() => { if (!undoPending) setUndoJob(null); }}>
+        <Modal title={undoJob.isSync ? "Undo this sync?" : "Undo this import?"} width={460}
+          onClose={() => { if (!undoPending) setUndoJob(null); }}>
           <p style={{ fontSize: 13, color: "var(--calv-slate)", margin: "0 0 8px", lineHeight: 1.5 }}>
             This permanently removes the <strong>{fmt(undoJob.imported)}</strong> client{undoJob.imported === 1 ? "" : "s"} added by{" "}
             <strong>{undoJob.filename}</strong>, along with their program enrollments and any services logged to them.
           </p>
+          {undoJob.isSync ? (
+            <p style={{ fontSize: 12.5, color: "var(--calv-slate-65)", margin: "0 0 8px", lineHeight: 1.5 }}>
+              It also removes the HMIS links this sync made, clears the matches it queued for review, and
+              restores the fields it filled in on existing records — so the sync can be run again from a
+              clean slate. The HMIS snapshot itself stays; the next sync replaces it.
+            </p>
+          ) : null}
           <p style={{ fontSize: 12.5, color: "var(--calv-slate-65)", margin: 0, lineHeight: 1.5 }}>
             Clients added or imported separately aren&rsquo;t affected. This can&rsquo;t be reversed.
           </p>

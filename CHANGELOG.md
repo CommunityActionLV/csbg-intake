@@ -6,13 +6,88 @@ tracks a federal instrument or guideline revision) are marked **[compliance]**
 
 ## Unreleased — 0.5.0 (roadmap Phases 1–5)
 
+### PA HMIS stored procedure: envelope, prefix and column corrections
+- **Fixes a silent zero-row sync.** The stored-procedure endpoint returns
+  `{"output": [], "result": {"table1": […]}}` — `result` not `data`, lowercase
+  `table1` — which the CRQL unwrapping found nothing in. The two endpoints now
+  have separate unwrappers rather than one helper guessing between them.
+- **Fixes a second silent zero.** The procedure's ID column is `clientID`, which
+  the CRQL-era key list (`ClientID`, `clientId`, `ClientId`, …) missed, so every
+  row would have been dropped for want of an ID even with the envelope fixed.
+- The **schema prefix is now optional** — `C_Report_Example` and
+  `dbo.C_Report_Example` both work — and the name is stored exactly as typed,
+  neither prefixed nor stripped, because the API echoes it back verbatim in
+  errors. URL-safety rejections and path encoding are unchanged.
+- The real 21-column payload is mapped by exact key, including the five
+  space-separated names. Columns received but not stored (`income`,
+  `enrollDate`, `enrolled Family Members`, …) are **reported on every sync**
+  rather than quietly dropped; `income` stays out of client records because it
+  would feed FPL determinations, and `enrolled Family Members` is never parsed
+  (its comma is both the intra- and inter-record separator).
+- **[compliance]** Characteristic values arrive as human-readable labels, not HUD
+  codes, and HUD's 2024 race wording doesn't match the CSBG instrument's options.
+  Unrecognized labels were already stored as-is rather than coerced; now they are
+  also reported loudly (sync result, audit row, `[hmis]` warning) so a vendor
+  wording change can't become quiet data corruption.
+- Run sync and Test connection now report the row count and the distinct
+  `relationship` values, so whether the procedure returns one row per client or
+  one per household can be settled from real data instead of assumed.
+
+### PA HMIS: stored procedure as the client source
+- **Settings → Integrations** gains a **Stored procedure** field (plus a JSON
+  parameters field). The setting is the switch: set it and the sync pulls clients
+  from `POST /crql/storedprocedures/{name}`; leave it blank and the sync uses the
+  CRQL `cmClient` query exactly as before. The panel shows which source is active.
+  Needed because the HUD elements (`HealthInsuranceType`, `SourceOfIncome`,
+  `NonCashBenefits`) live off `cmClient` and CRQL permits only one join, so no
+  single query can assemble them.
+- The name is normalized once at save (a bare name becomes `dbo.<name>`) and
+  validated as `schema.name` — it lands in a URL path segment, so anything with a
+  slash, `%`, `..`, whitespace or a second dot is rejected rather than sanitized.
+  Parameters must parse as a JSON object, checked at save rather than at sync.
+- The procedure's output shape is **unverified** (ours has never returned a row),
+  so responses are handled defensively: the CRQL envelope, a bare `{}`, a
+  message-only body, and multiple result sets all work, `recordCount` drives
+  nothing, and **every column the mapping doesn't understand is reported** in the
+  sync result, the audit row and a `[hmis]` warning. If rows come back but none
+  carry a recognizable client ID and name, the sync says so and lists the columns
+  it saw instead of reporting a clean zero.
+- `401` now says which of three things went wrong — subscription key, API key, or
+  "Eccovia has not enabled this procedure for your subscription", which is not a
+  credential problem and no longer reads like one. **Test connection** reports the
+  credential check and the procedure check separately, and lists the column names
+  a successful run returned.
+
+### PA HMIS rebuilt for CTAPI (replaces the OAuth2 assumption)
+- **[compliance]** The PA HMIS transport is Eccovia's ClientTrack API (CTAPI),
+  which has **no OAuth2, no token endpoint, and no client-list endpoint**. The
+  first cut of the connection panel assumed all three and could not produce a
+  working connection; it is replaced outright rather than kept behind a mode
+  selector. Auth is now the two static headers CTAPI requires
+  (`Ocp-Apim-Subscription-Key` and `Authorization: ApiKey …`) plus the optional
+  `OrgId` scope, HTTPS only, verified against PA_HMIS production.
+- Client listing moves to **CRQL** (`GET /crql`): mandatory `SELECT TOP n` bound
+  to the page size (without it a statewide select runs past 30 s), `pageNo` /
+  `pageSize` capped at CTAPI's 500, `shouldCache=true` so multi-page pulls can't
+  shear, a bare `{}` handled as an empty page, `recordCount` ignored because it
+  disagrees with reality, and `ClientID` 0 skipped as a system row.
+- **Test connection** now calls `GET /auth/test` and reports the environment
+  name CTAPI returns, so staff can see whether they reached production. A 401
+  reads as "credentials rejected" and is never retried; 500/502/503/504 retry
+  with backoff inside a bounded attempt count and a request timeout.
+- Stored credentials are **encrypted at rest** (AES-256-GCM, `src/lib/secrets.ts`)
+  with the key held outside the database — `CSBG_SECRET_KEY` or a generated
+  `data/secret.key` (0600) — so a database dump or backup carries no usable
+  credential. Any settings saved under the old OAuth2 shape are dropped on
+  upgrade; the CTAPI keys have to be entered once.
+
 ### Settings → Integrations + Apache/Ubuntu tier
-- New admin **Settings → Integrations** tab: configure the PA HMIS
-  connection (token URL, client ID/secret, base URL, clients path, scope,
-  page size) in the interface — saved to the database, applied immediately,
-  no shell access or restart needed. The secret is write-only (never sent
-  back to the browser, never audited); `HMIS_*` environment variables remain
-  as a fallback, and saved settings take precedence.
+- New admin **Settings → Integrations** tab: configure the PA HMIS connection
+  (base URL, subscription key, API key, Org ID, page size) in the interface —
+  saved to the database, applied immediately, no shell access or restart needed.
+  Both keys are write-only (never sent back to the browser, never audited);
+  `HMIS_*` environment variables remain as a fallback, and saved settings take
+  precedence.
 - New **`deploy/apache/`** tier: Apache reverse-proxy vhost (TLS via
   certbot), hardened systemd unit, and a step-by-step Ubuntu README
   (embedded database or PostgreSQL) — for agencies hosting on an existing

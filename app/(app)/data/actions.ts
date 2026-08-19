@@ -15,6 +15,7 @@ import { kvGet, kvSet, nextClientId } from "@/lib/data/core";
 import { importTemplate } from "@/lib/import-templates";
 import { getActiveFpl, getFplHistory, scheduleYearOn } from "@/lib/fpl";
 import { canonicalCharacteristic } from "@/lib/csbg-catalog";
+import { revertHmisSync } from "@/lib/hmis";
 import { annualizeEntry, INCOME_PERIODS, type IncomePeriod } from "@/lib/income";
 import { fmt, shortDate, todayIso } from "@/lib/format";
 
@@ -986,10 +987,14 @@ export async function undoImport(jobId: number): Promise<UndoResult> {
 
   const job = (await db.select().from(t.importJobs).where(eq(t.importJobs.id, jobId)))[0];
   if (!job) return { ok: false, message: "That import couldn't be found — it may already have been undone.", removed: 0 };
-  if (job.template !== "clients") {
-    return { ok: false, message: "Undo is only available for client-migration imports.", removed: 0 };
+  if (job.template !== "clients" && job.template !== "hmis") {
+    return { ok: false, message: "Undo is only available for client-migration imports and HMIS syncs.", removed: 0 };
   }
 
+  // An HMIS sync also touches records that already existed — links, queued
+  // reviews, blank-filled fields. Deleting those clients would be wrong, so the
+  // sync recorded what it did and undo reverses exactly that.
+  const reverted = job.template === "hmis" ? await revertHmisSync(job.hmisUndo) : null;
   // Additions to clients that already existed: those records must SURVIVE the
   // undo (they predate the import), so only the enrollment and the service rows
   // this job created for them come back out.
@@ -1015,15 +1020,19 @@ export async function undoImport(jobId: number): Promise<UndoResult> {
     // e.g. a sheet that only added second-program enrollments to existing clients.
     await reverseAdditions();
     await db.delete(t.importJobs).where(eq(t.importJobs.id, jobId));
-    if (addedBack) {
-      await audit(user.id, "data.import.undo", "integration", "sheets",
-        `${job.filename} · ${addedBack} added enrollment${addedBack === 1 ? "" : "s"} reversed`);
+    const undone = reverted ? ` ${reverted}` : "";
+    if (addedBack || reverted) {
+      await audit(user.id, job.template === "hmis" ? "hmis.sync.undo" : "data.import.undo",
+        "integration", job.template === "hmis" ? "hmis" : "sheets",
+        `${job.filename} · no client records created`
+        + (addedBack ? ` · ${addedBack} added enrollment${addedBack === 1 ? "" : "s"} reversed` : "")
+        + (reverted ? ` · ${reverted}` : ""));
       revalidatePath("/", "layout");
     }
     return {
       ok: true,
       removed: 0,
-      message: `No client records were created by that import — the log entry was cleared.${addedNote}`,
+      message: `No client records were created by that ${job.template === "hmis" ? "sync" : "import"} — the log entry was cleared.${undone}${addedNote}`,
     };
   }
   await reverseAdditions();
@@ -1032,6 +1041,10 @@ export async function undoImport(jobId: number): Promise<UndoResult> {
   await db.delete(t.clientPrograms).where(inArray(t.clientPrograms.clientId, ids));
   await db.delete(t.serviceLog).where(inArray(t.serviceLog.clientId, ids));
   await db.delete(t.outcomeLog).where(inArray(t.outcomeLog.clientId, ids));
+  // External-system links belong to the client, not to the other system: leaving
+  // them behind orphans a row pointing at a deleted client, and for HMIS it also
+  // makes the next sync treat that person as already linked.
+  await db.delete(t.clientExternalIds).where(inArray(t.clientExternalIds.clientId, ids));
   // Independent records that merely reference a client — unlink, don't destroy.
   await db.update(t.applications).set({ clientId: null }).where(inArray(t.applications.clientId, ids));
   await db.update(t.loans).set({ clientId: null }).where(inArray(t.loans.clientId, ids));
@@ -1043,14 +1056,18 @@ export async function undoImport(jobId: number): Promise<UndoResult> {
   await db.delete(t.clients).where(inArray(t.clients.id, ids));
   await db.delete(t.importJobs).where(eq(t.importJobs.id, jobId));
 
-  await audit(user.id, "data.import.undo", "integration", "sheets",
-    `${job.filename} · ${ids.length} imported client${ids.length === 1 ? "" : "s"} removed` +
-    (addedBack ? `, ${addedBack} added enrollment${addedBack === 1 ? "" : "s"} reversed` : ""));
+  await audit(user.id, job.template === "hmis" ? "hmis.sync.undo" : "data.import.undo",
+    "integration", job.template === "hmis" ? "hmis" : "sheets",
+    `${job.filename} · ${ids.length} imported client${ids.length === 1 ? "" : "s"} removed`
+    + (addedBack ? `, ${addedBack} added enrollment${addedBack === 1 ? "" : "s"} reversed` : "")
+    + (reverted ? ` · ${reverted}` : ""));
   revalidatePath("/", "layout");
 
   return {
     ok: true,
     removed: ids.length,
-    message: `Import undone — removed ${fmt(ids.length)} imported client${ids.length === 1 ? "" : "s"} and their enrollments.${addedNote}`,
+    message: `${job.template === "hmis" ? "Sync" : "Import"} undone — removed ${fmt(ids.length)} imported client`
+      + `${ids.length === 1 ? "" : "s"} and their enrollments.${reverted ? ` ${reverted}` : ""}${addedNote}`,
   };
 }
+
